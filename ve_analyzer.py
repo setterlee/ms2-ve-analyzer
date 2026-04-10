@@ -27,64 +27,36 @@ from pathlib import Path
 # 1. LECTURA DE ARCHIVOS
 # ─────────────────────────────────────────────
 
-def load_ve_table(table_path: str, msq_path: str = None, table_num: int = 1) -> dict:
+def load_ve_table(msq_path: str, table_num: int = 1) -> dict:
     """
-    Carga la tabla VE combinando dos fuentes:
-      - Bins (RPM / MAP): del .table exportado desde TunerStudio
-      - Valores VE:       del CurrentTune.msq (siempre actualizado)
-                          Si no se provee msq_path, usa los valores del .table.
-      - table_num:        número de tabla VE a leer del MSQ (1, 2 o 3)
+    Carga la tabla VE completa desde CurrentTune.msq:
+      - Bins RPM : frpm_table{N}
+      - Bins MAP : fmap_table{N}
+      - Valores  : veTable{N}
     """
-    with open(table_path) as f:
-        content = f.read()
+    with open(msq_path, errors='replace') as f:
+        msq = f.read()
 
-    xa = re.search(r'<xAxis[^>]+>(.*?)</xAxis>', content, re.DOTALL)
-    ya = re.search(r'<yAxis[^>]+>(.*?)</yAxis>', content, re.DOTALL)
-    za = re.search(r'<zValues[^>]+>(.*?)</zValues>', content, re.DOTALL)
+    def get_constant(name):
+        m = re.search(rf'name="{name}"[^>]*>(.*?)</constant>', msq, re.DOTALL)
+        if not m:
+            raise ValueError(f"No se encontró '{name}' en {msq_path}")
+        return [float(x) for x in re.findall(r'[\d.]+', m.group(1))]
 
-    if not (xa and ya and za):
-        raise ValueError(f"No se encontraron ejes/valores en {table_path}")
+    rpm_bins = [int(v) for v in get_constant(f'frpm_table{table_num}')]
+    map_bins = get_constant(f'fmap_table{table_num}')
+    ve_values = get_constant(f'veTable{table_num}')
 
-    rpm_bins = [int(float(x)) for x in re.findall(r'[\d.]+', xa.group(1))]
-    map_bins = [float(x) for x in re.findall(r'[\d.]+', ya.group(1))]
     n_rows, n_cols = len(map_bins), len(rpm_bins)
+    if len(ve_values) != n_rows * n_cols:
+        raise ValueError(f"veTable{table_num} tiene {len(ve_values)} valores, "
+                         f"esperaba {n_rows * n_cols}")
 
-    # Intentar leer valores VE desde CurrentTune.msq
-    ve_source = table_path
-    if msq_path and os.path.exists(msq_path):
-        with open(msq_path, errors='replace') as f:
-            msq = f.read()
-        ve_key = f'veTable{table_num}'
-        idx = msq.find(ve_key)
-        if idx >= 0:
-            end = msq.find('</constant>', idx) + 11
-            block = msq[idx:end]
-            values = [float(x) for x in re.findall(r'\d+\.\d+', block)]
-            if len(values) == n_rows * n_cols:
-                ve_source = msq_path
-            else:
-                print(f"  [!] {ve_key} en MSQ tiene {len(values)} valores, "
-                      f"esperaba {n_rows*n_cols}. Usando valores del .table.")
-                values = None
-        else:
-            values = None
-    else:
-        values = None
-
-    if values is None:
-        values = [float(x) for x in re.findall(r'[\d.]+', za.group(1))]
-        ve_source = table_path
-
-    if len(values) != n_rows * n_cols:
-        raise ValueError(f"No se pudo cargar la tabla VE: {len(values)} valores, "
-                         f"esperaba {n_rows*n_cols}")
-
-    ve = [values[r * n_cols:(r + 1) * n_cols] for r in range(n_rows)]
-    print(f"  Bins  : {os.path.basename(table_path)}")
-    print(f"  VE    : {os.path.basename(ve_source)}")
+    ve = [ve_values[r * n_cols:(r + 1) * n_cols] for r in range(n_rows)]
+    print(f"  Fuente: {os.path.basename(msq_path)}  (tabla {table_num})")
     return {'rpm_bins': rpm_bins, 'map_bins': map_bins, 've': ve,
             'n_rows': n_rows, 'n_cols': n_cols,
-            've_source': ve_source, 'bins_source': table_path}
+            've_source': msq_path, 'bins_source': msq_path}
 
 
 def load_ae_config(msq_path: str) -> dict:
@@ -266,14 +238,10 @@ def print_report(result: dict, ae_cfg: dict, log_files: list, ve_data: dict):
     lean = result['lean']
     rich = result['rich']
 
-    ve_src   = os.path.basename(ve_data['ve_source'])
-    bins_src = os.path.basename(ve_data['bins_source'])
-
     print("\n" + "="*60)
     print("  ANÁLISIS VE — MegaSquirt MS2")
     print("="*60)
-    print(f"  VE valores : {ve_src}")
-    print(f"  VE bins    : {bins_src}")
+    print(f"  Fuente VE  : {os.path.basename(ve_data['ve_source'])}")
     print(f"  Logs       : {', '.join(os.path.basename(f) for f in log_files)}")
     print(f"  Muestras   : {ae['total']:,} válidas")
     print()
@@ -327,7 +295,7 @@ def print_report(result: dict, ae_cfg: dict, log_files: list, ve_data: dict):
 # 4. GENERACIÓN DEL .table CORREGIDO
 # ─────────────────────────────────────────────
 
-def generate_table(result: dict, ve_data: dict, source_table: str, out_path: str):
+def generate_table(result: dict, ve_data: dict, out_path: str):
     """Aplica correcciones al VE y guarda un nuevo .table."""
     import copy
     ve_new = copy.deepcopy(ve_data['ve'])
@@ -407,14 +375,6 @@ def select_logs_interactive(log_dir: str) -> list:
     return [logs[i] for i in indices] if indices else logs[:2]
 
 
-def find_latest_table(project_dir: str, table_num: int = 1) -> str:
-    prefix = f'veTable{table_num}'
-    tables = [f for f in glob.glob(os.path.join(project_dir, '*.table'))
-              if prefix in os.path.basename(f)]
-    if not tables:
-        raise FileNotFoundError(f"No se encontró ningún {prefix}*.table en el directorio")
-    return max(tables, key=os.path.getmtime)
-
 
 # ─────────────────────────────────────────────
 # 6. MAIN
@@ -427,14 +387,12 @@ def main():
                         help='Archivos .msl a analizar')
     parser.add_argument('--latest', type=int, metavar='N',
                         help='Usar los N logs más recientes')
-    parser.add_argument('--table', metavar='FILE',
-                        help='Archivo .table VE base (default: más reciente en el dir)')
     parser.add_argument('--msq', default='CurrentTune.msq',
-                        help='Archivo MSQ con configuración AE (default: CurrentTune.msq)')
+                        help='Archivo MSQ (default: CurrentTune.msq)')
     parser.add_argument('--table-num', type=int, default=1, choices=[1, 2, 3],
-                        help='Número de tabla VE del MSQ a usar (default: 1)')
+                        help='Número de tabla VE a usar del MSQ (default: 1)')
     parser.add_argument('--min-samples', type=int, default=5,
-                        help='Mínimo de muestras por celda para considerar (default: 5)')
+                        help='Mínimo de muestras por celda (default: 5)')
     parser.add_argument('--out', metavar='FILE',
                         help='Nombre del .table de salida (default: auto)')
     parser.add_argument('--log-dir', default='DataLogs',
@@ -443,6 +401,8 @@ def main():
 
     project_dir = os.path.dirname(os.path.abspath(__file__))
     log_dir     = os.path.join(project_dir, args.log_dir)
+    msq_path    = os.path.join(project_dir, args.msq)
+    table_num   = args.table_num
 
     # ── Selección de logs ──
     if args.logs:
@@ -461,21 +421,14 @@ def main():
         print("No se seleccionaron logs.")
         sys.exit(1)
 
-    # ── Rutas de archivos de configuración ──
-    msq_path   = os.path.join(project_dir, args.msq)
-    table_num  = args.table_num
-    table_path = args.table or find_latest_table(project_dir, table_num)
+    if not os.path.exists(msq_path):
+        print(f"Error: no se encontró {args.msq}")
+        sys.exit(1)
 
-    # ── Cargar tabla VE ──
+    # ── Cargar tabla VE y config AE desde MSQ ──
     print(f"\nCargando tabla VE (tabla {table_num}):")
-    ve_data = load_ve_table(table_path, msq_path if os.path.exists(msq_path) else None, table_num)
-
-    # ── Cargar config AE ──
-    if os.path.exists(msq_path):
-        ae_cfg = load_ae_config(msq_path)
-    else:
-        print(f"  [!] No se encontró {args.msq}, AE config no disponible.")
-        ae_cfg = {}
+    ve_data = load_ve_table(msq_path, table_num)
+    ae_cfg  = load_ae_config(msq_path)
 
     # ── Parsear logs ──
     print(f"\nParsando {len(log_files)} log(s)...")
@@ -492,10 +445,10 @@ def main():
 
     # ── Generar .table corregido ──
     if result['lean'] or result['rich']:
-        ts   = datetime.now().strftime('%Y-%m-%d_%H.%M')
-        out  = args.out or os.path.join(project_dir, f'veTable{table_num}Tbl_{ts}_corrected.table')
+        ts  = datetime.now().strftime('%Y-%m-%d_%H.%M')
+        out = args.out or os.path.join(project_dir, f'veTable{table_num}Tbl_{ts}_corrected.table')
         print("── TABLA CORREGIDA ───────────────────────────────────")
-        generate_table(result, ve_data, table_path, out)
+        generate_table(result, ve_data, out)
     else:
         print("No hay correcciones que aplicar.")
 
