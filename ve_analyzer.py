@@ -1,0 +1,498 @@
+#!/usr/bin/env python3
+"""
+ve_analyzer.py — Analizador de mezcla VE para MegaSquirt MS2 / TunerStudio
+
+Uso:
+  python3 ve_analyzer.py                    # modo interactivo
+  python3 ve_analyzer.py --latest 3         # últimos N logs
+  python3 ve_analyzer.py --logs f1.msl f2.msl
+  python3 ve_analyzer.py --table mi_ve.table --latest 2
+
+Requiere en el mismo directorio:
+  - CurrentTune.msq    (configuración activa: AE, etc.)
+  - Un archivo .table  (tabla VE actual exportada desde TunerStudio)
+  - DataLogs/*.msl     (logs de datos)
+"""
+
+import argparse
+import glob
+import os
+import re
+import sys
+from datetime import datetime
+from pathlib import Path
+
+
+# ─────────────────────────────────────────────
+# 1. LECTURA DE ARCHIVOS
+# ─────────────────────────────────────────────
+
+def load_ve_table(table_path: str, msq_path: str = None) -> dict:
+    """
+    Carga la tabla VE combinando dos fuentes:
+      - Bins (RPM / MAP): del .table exportado desde TunerStudio
+      - Valores VE:       del CurrentTune.msq (siempre actualizado)
+                          Si no se provee msq_path, usa los valores del .table.
+    """
+    with open(table_path) as f:
+        content = f.read()
+
+    xa = re.search(r'<xAxis[^>]+>(.*?)</xAxis>', content, re.DOTALL)
+    ya = re.search(r'<yAxis[^>]+>(.*?)</yAxis>', content, re.DOTALL)
+    za = re.search(r'<zValues[^>]+>(.*?)</zValues>', content, re.DOTALL)
+
+    if not (xa and ya and za):
+        raise ValueError(f"No se encontraron ejes/valores en {table_path}")
+
+    rpm_bins = [int(float(x)) for x in re.findall(r'[\d.]+', xa.group(1))]
+    map_bins = [float(x) for x in re.findall(r'[\d.]+', ya.group(1))]
+    n_rows, n_cols = len(map_bins), len(rpm_bins)
+
+    # Intentar leer valores VE desde CurrentTune.msq
+    ve_source = table_path
+    if msq_path and os.path.exists(msq_path):
+        with open(msq_path, errors='replace') as f:
+            msq = f.read()
+        idx = msq.find('veTable1')
+        if idx >= 0:
+            end = msq.find('</constant>', idx) + 11
+            block = msq[idx:end]
+            values = [float(x) for x in re.findall(r'\d+\.\d+', block)]
+            if len(values) == n_rows * n_cols:
+                ve_source = msq_path
+            else:
+                print(f"  [!] veTable1 en MSQ tiene {len(values)} valores, "
+                      f"esperaba {n_rows*n_cols}. Usando valores del .table.")
+                values = None
+        else:
+            values = None
+    else:
+        values = None
+
+    if values is None:
+        values = [float(x) for x in re.findall(r'[\d.]+', za.group(1))]
+        ve_source = table_path
+
+    if len(values) != n_rows * n_cols:
+        raise ValueError(f"No se pudo cargar la tabla VE: {len(values)} valores, "
+                         f"esperaba {n_rows*n_cols}")
+
+    ve = [values[r * n_cols:(r + 1) * n_cols] for r in range(n_rows)]
+    print(f"  Bins  : {os.path.basename(table_path)}")
+    print(f"  VE    : {os.path.basename(ve_source)}")
+    return {'rpm_bins': rpm_bins, 'map_bins': map_bins, 've': ve,
+            'n_rows': n_rows, 'n_cols': n_cols,
+            've_source': ve_source, 'bins_source': table_path}
+
+
+def load_ae_config(msq_path: str) -> dict:
+    """Extrae configuración AE/TAE del CurrentTune.msq."""
+    with open(msq_path, errors='replace') as f:
+        content = f.read()
+
+    def get_values(name):
+        m = re.search(rf'name="{name}"[^>]*>(.*?)</constant>', content, re.DOTALL)
+        if m:
+            return [float(x) for x in re.findall(r'[\d.]+', m.group(1))]
+        return None
+
+    def get_scalar(name):
+        m = re.search(rf'name="{name}"[^>]*>([\d.]+)</constant>', content)
+        if m:
+            return float(m.group(1))
+        return None
+
+    return {
+        'taeRates':    get_values('taeRates'),
+        'taeBins':     get_values('taeBins'),
+        'maeRates':    get_values('maeRates'),
+        'maeBins':     get_values('maeBins'),
+        'taeTime':     get_scalar('taeTime'),
+        'tpsThresh':   get_scalar('tpsThresh'),
+        'aeTaperTime': get_scalar('aeTaperTime'),
+        'aeEndPW':     get_scalar('aeEndPW'),
+    }
+
+
+def load_msl_logs(log_files: list) -> list:
+    """Parsea uno o más .msl (texto tab-delimitado con header binario)."""
+    all_rows = []
+    for fname in log_files:
+        with open(fname, 'rb') as fh:
+            raw = fh.read()
+        text_start = raw.find(b'Time')
+        if text_start < 0:
+            print(f"  [!] No se encontró header en {fname}, omitiendo.")
+            continue
+        text  = raw[text_start:].decode('latin-1', errors='replace')
+        lines = text.split('\n')
+        if len(lines) < 3:
+            continue
+        headers = lines[0].strip().split('\t')
+        cols    = {h.strip(): i for i, h in enumerate(headers)}
+
+        required = ['RPM', 'MAP', 'AFR', 'TPS', 'CLT']
+        missing  = [c for c in required if c not in cols]
+        if missing:
+            print(f"  [!] Faltan columnas {missing} en {fname}, omitiendo.")
+            continue
+
+        for line in lines[2:]:
+            parts = line.strip().split('\t')
+            if len(parts) < 10:
+                continue
+            try:
+                row = {
+                    'rpm':      float(parts[cols['RPM']]),
+                    'map':      float(parts[cols['MAP']]),
+                    'afr':      float(parts[cols['AFR']]),
+                    'tps':      float(parts[cols['TPS']]),
+                    'clt':      float(parts[cols['CLT']]),
+                    'tpsdot':   float(parts[cols['TPSdot']])   if 'TPSdot'    in cols else 0.0,
+                    'accel_pw': float(parts[cols['Accel PW']]) if 'Accel PW'  in cols else 0.0,
+                    'ego_cor':  float(parts[cols['EGO cor1']]) if 'EGO cor1'  in cols else 100.0,
+                }
+            except (ValueError, IndexError):
+                continue
+
+            # Filtros: motor encendido, AFR válido, motor caliente
+            if row['rpm'] < 400 or not (8.0 < row['afr'] < 20.0) or row['clt'] < 70:
+                continue
+            all_rows.append(row)
+
+    return all_rows
+
+
+# ─────────────────────────────────────────────
+# 2. ANÁLISIS
+# ─────────────────────────────────────────────
+
+def find_bin(val: float, bins: list) -> int:
+    return min(range(len(bins)), key=lambda i: abs(val - bins[i]))
+
+
+def target_afr(map_kpa: float) -> float:
+    """AFR objetivo según zona de carga."""
+    if map_kpa <= 40:  return 14.5   # vacío / crucero ligero
+    if map_kpa <= 55:  return 14.2   # crucero medio
+    if map_kpa <= 75:  return 13.8   # carga media
+    return 13.0                       # carga alta / WOT
+
+
+def analyze(rows: list, ve_data: dict, ae_cfg: dict, min_samples: int = 5) -> dict:
+    """Calcula AFR promedio por celda, separando muestras con/sin AE activo."""
+    rpm_bins = ve_data['rpm_bins']
+    map_bins = ve_data['map_bins']
+    ve       = ve_data['ve']
+    tps_thresh = ae_cfg.get('tpsThresh') or 20.0
+
+    # Separar muestras
+    ae_on  = [r for r in rows if r['accel_pw'] > 0.05]
+    ae_off = [r for r in rows if r['accel_pw'] <= 0.05]
+    # Falsos positivos AE: accel_pw > 0 pero tpsdot bajo (período de tapering)
+    ae_taper = [r for r in ae_on if abs(r['tpsdot']) < tps_thresh]
+
+    # Acumular AFR por celda (solo sin AE para correcciones limpias)
+    cell_afrs = {}
+    for row in ae_off:
+        mi = find_bin(row['map'], map_bins)
+        ri = find_bin(row['rpm'], rpm_bins)
+        cell_afrs.setdefault((mi, ri), []).append(row['afr'])
+
+    # Calcular correcciones
+    lean_cells = []
+    rich_cells = []
+    ok_cells   = []
+
+    for (mi, ri), afrs in sorted(cell_afrs.items()):
+        if len(afrs) < min_samples:
+            continue
+        avg  = sum(afrs) / len(afrs)
+        m    = map_bins[mi]
+        r    = rpm_bins[ri]
+        tgt  = target_afr(m)
+        vc   = ve[mi][ri]
+        vn   = round(vc * avg / tgt)
+        delta = vn - vc
+
+        entry = {
+            'mi': mi, 'ri': ri, 'map': m, 'rpm': r,
+            'afr_avg': avg, 'target': tgt, 'n': len(afrs),
+            've_cur': vc, 've_new': vn, 'delta': delta,
+        }
+
+        if avg > 14.5:
+            lean_cells.append(entry)
+        elif avg < 13.0:
+            rich_cells.append(entry)
+        else:
+            ok_cells.append(entry)
+
+    # Estadísticas AE
+    afrs_all = [r['afr'] for r in rows]
+    afrs_on  = [r['afr'] for r in ae_on]
+    afrs_off = [r['afr'] for r in ae_off]
+
+    ae_stats = {
+        'total':        len(rows),
+        'ae_on_pct':    100 * len(ae_on) / max(len(rows), 1),
+        'ae_off_pct':   100 * len(ae_off) / max(len(rows), 1),
+        'taper_pct':    100 * len(ae_taper) / max(len(ae_on), 1),
+        'afr_all_avg':  sum(afrs_all) / max(len(afrs_all), 1),
+        'afr_on_avg':   sum(afrs_on)  / max(len(afrs_on), 1)  if afrs_on  else None,
+        'afr_off_avg':  sum(afrs_off) / max(len(afrs_off), 1) if afrs_off else None,
+        'lean_on_pct':  100 * sum(1 for a in afrs_on  if a > 14.5) / max(len(afrs_on), 1),
+        'lean_off_pct': 100 * sum(1 for a in afrs_off if a > 14.5) / max(len(afrs_off), 1),
+        'rich_on_pct':  100 * sum(1 for a in afrs_on  if a < 13.0) / max(len(afrs_on), 1),
+    }
+
+    return {
+        'lean': lean_cells,
+        'rich': rich_cells,
+        'ok':   ok_cells,
+        'ae':   ae_stats,
+        'rows': rows,
+    }
+
+
+# ─────────────────────────────────────────────
+# 3. REPORTE
+# ─────────────────────────────────────────────
+
+def print_report(result: dict, ae_cfg: dict, log_files: list, ve_data: dict):
+    ae   = result['ae']
+    lean = result['lean']
+    rich = result['rich']
+
+    ve_src   = os.path.basename(ve_data['ve_source'])
+    bins_src = os.path.basename(ve_data['bins_source'])
+
+    print("\n" + "="*60)
+    print("  ANÁLISIS VE — MegaSquirt MS2")
+    print("="*60)
+    print(f"  VE valores : {ve_src}")
+    print(f"  VE bins    : {bins_src}")
+    print(f"  Logs       : {', '.join(os.path.basename(f) for f in log_files)}")
+    print(f"  Muestras   : {ae['total']:,} válidas")
+    print()
+
+    print("── CONFIGURACIÓN AE ──────────────────────────────────")
+    print(f"  tpsThresh   : {ae_cfg.get('tpsThresh')} %/s")
+    print(f"  taeRates    : {ae_cfg.get('taeRates')}  (%/s bins)")
+    print(f"  taeBins     : {ae_cfg.get('taeBins')}  (ms added)")
+    print(f"  taeTime     : {ae_cfg.get('taeTime')} s")
+    print(f"  aeTaperTime : {ae_cfg.get('aeTaperTime')} s")
+    print()
+
+    print("── RESUMEN AE ────────────────────────────────────────")
+    print(f"  Con AE activo   : {ae['ae_on_pct']:.1f}%  "
+          f"(AFR avg {ae['afr_on_avg']:.2f}  — "
+          f"pobres {ae['lean_on_pct']:.0f}%  ricos {ae['rich_on_pct']:.0f}%)")
+    print(f"  Sin AE          : {ae['ae_off_pct']:.1f}%  "
+          f"(AFR avg {ae['afr_off_avg']:.2f}  — "
+          f"pobres {ae['lean_off_pct']:.0f}%)")
+    print(f"  Tapering (tpsdot<thresh con AE>0): {ae['taper_pct']:.0f}% del AE total")
+    print()
+
+    def table_header():
+        print(f"  {'MAP':>5} {'RPM':>6} {'AFR':>7} {'Target':>7} {'n':>5}  "
+              f"{'VE_act':>6} {'VE_nuevo':>8} {'Δ':>4}")
+        print("  " + "-"*54)
+
+    if lean:
+        print(f"── ZONAS POBRES (AFR>14.5) — {len(lean)} celdas ──────────")
+        table_header()
+        for c in sorted(lean, key=lambda x: -x['delta']):
+            print(f"  {c['map']:>5.0f} {c['rpm']:>6} {c['afr_avg']:>7.2f} "
+                  f"{c['target']:>7.1f} {c['n']:>5}  "
+                  f"{c['ve_cur']:>6.0f} {c['ve_new']:>8} {c['delta']:>+4}")
+        print()
+
+    if rich:
+        print(f"── ZONAS RICAS (AFR<13.0) — {len(rich)} celdas ──────────")
+        table_header()
+        for c in sorted(rich, key=lambda x: x['delta']):
+            print(f"  {c['map']:>5.0f} {c['rpm']:>6} {c['afr_avg']:>7.2f} "
+                  f"{c['target']:>7.1f} {c['n']:>5}  "
+                  f"{c['ve_cur']:>6.0f} {c['ve_new']:>8} {c['delta']:>+4}")
+        print()
+
+    if not lean and not rich:
+        print("  ✓ Sin zonas fuera de objetivo. Mezcla dentro de rango.\n")
+
+
+# ─────────────────────────────────────────────
+# 4. GENERACIÓN DEL .table CORREGIDO
+# ─────────────────────────────────────────────
+
+def generate_table(result: dict, ve_data: dict, source_table: str, out_path: str):
+    """Aplica correcciones al VE y guarda un nuevo .table."""
+    import copy
+    ve_new = copy.deepcopy(ve_data['ve'])
+
+    for c in result['lean'] + result['rich']:
+        ve_new[c['mi']][c['ri']] = float(c['ve_new'])
+
+    rpm_bins = ve_data['rpm_bins']
+    map_bins = ve_data['map_bins']
+
+    z_rows = "\n".join(
+        "         " + " ".join(f"{v:.1f}" for v in row) + " "
+        for row in ve_new
+    )
+    now = datetime.now().strftime("%a %b %d %H:%M:%S CLST %Y")
+
+    xml = f'''<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<tableData xmlns="http://www.EFIAnalytics.com/:table">
+<bibliography author="EFI Analytics - philip.tobin@yahoo.com" company="EFI Analytics, copyright 2010, All Rights Reserved." writeDate="{now}"/>
+<versionInfo fileFormat="1.0"/>
+<table cols="{ve_data['n_cols']}" rows="{ve_data['n_rows']}">
+<xAxis cols="{ve_data['n_cols']}" name="rpm">
+{chr(10).join("         " + str(r) + " " for r in rpm_bins)}
+      </xAxis>
+<yAxis name="fuelload" rows="{ve_data['n_rows']}">
+{chr(10).join("         " + str(m) + " " for m in map_bins)}
+      </yAxis>
+<zValues cols="{ve_data['n_cols']}" rows="{ve_data['n_rows']}">
+{z_rows}
+      </zValues>
+</table>
+</tableData>
+'''
+    with open(out_path, 'w') as f:
+        f.write(xml)
+
+    total = len(result['lean']) + len(result['rich'])
+    print(f"  Tabla corregida guardada: {out_path}")
+    print(f"  Celdas modificadas: {total} "
+          f"({len(result['lean'])} pobres, {len(result['rich'])} ricas)")
+
+
+# ─────────────────────────────────────────────
+# 5. SELECCIÓN INTERACTIVA
+# ─────────────────────────────────────────────
+
+def select_logs_interactive(log_dir: str) -> list:
+    logs = sorted(glob.glob(os.path.join(log_dir, '*.msl')),
+                  key=os.path.getmtime, reverse=True)
+    if not logs:
+        print(f"No se encontraron .msl en {log_dir}")
+        sys.exit(1)
+
+    print("\nLogs disponibles (más recientes primero):")
+    for i, f in enumerate(logs[:20]):
+        size_kb = os.path.getsize(f) / 1024
+        mtime   = datetime.fromtimestamp(os.path.getmtime(f)).strftime('%Y-%m-%d %H:%M')
+        print(f"  {i+1:2d}. {os.path.basename(f):40s}  {size_kb:7.0f} KB  {mtime}")
+    if len(logs) > 20:
+        print(f"  ... y {len(logs)-20} más antiguos")
+
+    print("\nEscribe los números separados por comas (ej: 1,2,3) o 'Enter' para los 2 más recientes:")
+    sel = input("  > ").strip()
+
+    if not sel:
+        return logs[:2]
+
+    indices = []
+    for part in sel.split(','):
+        part = part.strip()
+        if part.isdigit():
+            idx = int(part) - 1
+            if 0 <= idx < len(logs):
+                indices.append(idx)
+            else:
+                print(f"  [!] Número fuera de rango: {part}")
+    return [logs[i] for i in indices] if indices else logs[:2]
+
+
+def find_latest_table(project_dir: str) -> str:
+    tables = [f for f in glob.glob(os.path.join(project_dir, '*.table'))
+              if 'veTable1' in os.path.basename(f)]
+    if not tables:
+        raise FileNotFoundError("No se encontró ningún veTable1*.table en el directorio")
+    return max(tables, key=os.path.getmtime)
+
+
+# ─────────────────────────────────────────────
+# 6. MAIN
+# ─────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Analiza logs MSL y genera tabla VE corregida para TunerStudio')
+    parser.add_argument('--logs', nargs='+', metavar='FILE',
+                        help='Archivos .msl a analizar')
+    parser.add_argument('--latest', type=int, metavar='N',
+                        help='Usar los N logs más recientes')
+    parser.add_argument('--table', metavar='FILE',
+                        help='Archivo .table VE base (default: más reciente en el dir)')
+    parser.add_argument('--msq', default='CurrentTune.msq',
+                        help='Archivo MSQ con configuración AE (default: CurrentTune.msq)')
+    parser.add_argument('--min-samples', type=int, default=5,
+                        help='Mínimo de muestras por celda para considerar (default: 5)')
+    parser.add_argument('--out', metavar='FILE',
+                        help='Nombre del .table de salida (default: auto)')
+    parser.add_argument('--log-dir', default='DataLogs',
+                        help='Directorio de logs (default: DataLogs)')
+    args = parser.parse_args()
+
+    project_dir = os.path.dirname(os.path.abspath(__file__))
+    log_dir     = os.path.join(project_dir, args.log_dir)
+
+    # ── Selección de logs ──
+    if args.logs:
+        log_files = args.logs
+    elif args.latest:
+        all_logs  = sorted(glob.glob(os.path.join(log_dir, '*.msl')),
+                           key=os.path.getmtime, reverse=True)
+        log_files = all_logs[:args.latest]
+        print(f"Usando los {args.latest} logs más recientes:")
+        for f in log_files:
+            print(f"  {os.path.basename(f)}")
+    else:
+        log_files = select_logs_interactive(log_dir)
+
+    if not log_files:
+        print("No se seleccionaron logs.")
+        sys.exit(1)
+
+    # ── Rutas de archivos de configuración ──
+    msq_path   = os.path.join(project_dir, args.msq)
+    table_path = args.table or find_latest_table(project_dir)
+
+    # ── Cargar tabla VE ──
+    print(f"\nCargando tabla VE:")
+    ve_data = load_ve_table(table_path, msq_path if os.path.exists(msq_path) else None)
+
+    # ── Cargar config AE ──
+    if os.path.exists(msq_path):
+        ae_cfg = load_ae_config(msq_path)
+    else:
+        print(f"  [!] No se encontró {args.msq}, AE config no disponible.")
+        ae_cfg = {}
+
+    # ── Parsear logs ──
+    print(f"\nParsando {len(log_files)} log(s)...")
+    rows = load_msl_logs(log_files)
+    if not rows:
+        print("No se encontraron muestras válidas.")
+        sys.exit(1)
+
+    # ── Análisis ──
+    result = analyze(rows, ve_data, ae_cfg, min_samples=args.min_samples)
+
+    # ── Reporte ──
+    print_report(result, ae_cfg, log_files, ve_data)
+
+    # ── Generar .table corregido ──
+    if result['lean'] or result['rich']:
+        ts   = datetime.now().strftime('%Y-%m-%d_%H.%M')
+        out  = args.out or os.path.join(project_dir, f'veTable1Tbl_{ts}_corrected.table')
+        print("── TABLA CORREGIDA ───────────────────────────────────")
+        generate_table(result, ve_data, table_path, out)
+    else:
+        print("No hay correcciones que aplicar.")
+
+
+if __name__ == '__main__':
+    main()
