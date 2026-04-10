@@ -27,12 +27,13 @@ from pathlib import Path
 # 1. LECTURA DE ARCHIVOS
 # ─────────────────────────────────────────────
 
-def load_ve_table(table_path: str, msq_path: str = None) -> dict:
+def load_ve_table(table_path: str, msq_path: str = None, table_num: int = 1) -> dict:
     """
     Carga la tabla VE combinando dos fuentes:
       - Bins (RPM / MAP): del .table exportado desde TunerStudio
       - Valores VE:       del CurrentTune.msq (siempre actualizado)
                           Si no se provee msq_path, usa los valores del .table.
+      - table_num:        número de tabla VE a leer del MSQ (1, 2 o 3)
     """
     with open(table_path) as f:
         content = f.read()
@@ -53,7 +54,8 @@ def load_ve_table(table_path: str, msq_path: str = None) -> dict:
     if msq_path and os.path.exists(msq_path):
         with open(msq_path, errors='replace') as f:
             msq = f.read()
-        idx = msq.find('veTable1')
+        ve_key = f'veTable{table_num}'
+        idx = msq.find(ve_key)
         if idx >= 0:
             end = msq.find('</constant>', idx) + 11
             block = msq[idx:end]
@@ -61,7 +63,7 @@ def load_ve_table(table_path: str, msq_path: str = None) -> dict:
             if len(values) == n_rows * n_cols:
                 ve_source = msq_path
             else:
-                print(f"  [!] veTable1 en MSQ tiene {len(values)} valores, "
+                print(f"  [!] {ve_key} en MSQ tiene {len(values)} valores, "
                       f"esperaba {n_rows*n_cols}. Usando valores del .table.")
                 values = None
         else:
@@ -405,11 +407,12 @@ def select_logs_interactive(log_dir: str) -> list:
     return [logs[i] for i in indices] if indices else logs[:2]
 
 
-def find_latest_table(project_dir: str) -> str:
+def find_latest_table(project_dir: str, table_num: int = 1) -> str:
+    prefix = f'veTable{table_num}'
     tables = [f for f in glob.glob(os.path.join(project_dir, '*.table'))
-              if 'veTable1' in os.path.basename(f)]
+              if prefix in os.path.basename(f)]
     if not tables:
-        raise FileNotFoundError("No se encontró ningún veTable1*.table en el directorio")
+        raise FileNotFoundError(f"No se encontró ningún {prefix}*.table en el directorio")
     return max(tables, key=os.path.getmtime)
 
 
@@ -428,6 +431,8 @@ def main():
                         help='Archivo .table VE base (default: más reciente en el dir)')
     parser.add_argument('--msq', default='CurrentTune.msq',
                         help='Archivo MSQ con configuración AE (default: CurrentTune.msq)')
+    parser.add_argument('--table-num', type=int, default=1, choices=[1, 2, 3],
+                        help='Número de tabla VE del MSQ a usar (default: 1)')
     parser.add_argument('--min-samples', type=int, default=5,
                         help='Mínimo de muestras por celda para considerar (default: 5)')
     parser.add_argument('--out', metavar='FILE',
@@ -458,11 +463,12 @@ def main():
 
     # ── Rutas de archivos de configuración ──
     msq_path   = os.path.join(project_dir, args.msq)
-    table_path = args.table or find_latest_table(project_dir)
+    table_num  = args.table_num
+    table_path = args.table or find_latest_table(project_dir, table_num)
 
     # ── Cargar tabla VE ──
-    print(f"\nCargando tabla VE:")
-    ve_data = load_ve_table(table_path, msq_path if os.path.exists(msq_path) else None)
+    print(f"\nCargando tabla VE (tabla {table_num}):")
+    ve_data = load_ve_table(table_path, msq_path if os.path.exists(msq_path) else None, table_num)
 
     # ── Cargar config AE ──
     if os.path.exists(msq_path):
@@ -487,7 +493,7 @@ def main():
     # ── Generar .table corregido ──
     if result['lean'] or result['rich']:
         ts   = datetime.now().strftime('%Y-%m-%d_%H.%M')
-        out  = args.out or os.path.join(project_dir, f'veTable1Tbl_{ts}_corrected.table')
+        out  = args.out or os.path.join(project_dir, f'veTable{table_num}Tbl_{ts}_corrected.table')
         print("── TABLA CORREGIDA ───────────────────────────────────")
         generate_table(result, ve_data, table_path, out)
     else:
