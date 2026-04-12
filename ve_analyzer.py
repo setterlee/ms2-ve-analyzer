@@ -153,12 +153,39 @@ def target_afr(map_kpa: float) -> float:
     return 13.0                       # carga alta / WOT
 
 
-def analyze(rows: list, ve_data: dict, ae_cfg: dict, min_samples: int = 5) -> dict:
+def zone_min_samples(map_kpa: float, base: int) -> int:
+    """Mínimo de muestras según zona — más exigente en zonas ruidosas."""
+    if map_kpa <= 40:  return max(base, 20)   # ralentí/vacío: muy ruidoso
+    if map_kpa <= 55:  return max(base, 10)   # crucero ligero: algo ruidoso
+    return base                                # carga media/alta: usar base
+
+
+def cell_damping(mi: int, ri: int, history: list) -> float:
+    """
+    Factor de amortiguación 0.0–1.0 según historial de la celda.
+    Si la celda fue corregida en direcciones opuestas → 0.5 (mitad de corrección).
+    Si no hay historial de oscilación → 1.0 (corrección completa).
+    """
+    signs = []
+    for session in history:
+        for c in session['corrections']:
+            if c['mi'] == mi and c['ri'] == ri and abs(c['delta']) >= 1:
+                signs.append(1 if c['delta'] > 0 else -1)
+    if len(signs) < 2:
+        return 1.0
+    # Detectar cambios de signo
+    changes = sum(1 for i in range(len(signs) - 1) if signs[i] != signs[i + 1])
+    return 0.5 if changes >= 1 else 1.0
+
+
+def analyze(rows: list, ve_data: dict, ae_cfg: dict,
+            min_samples: int = 5, history: list = None) -> dict:
     """Calcula AFR promedio por celda, separando muestras con/sin AE activo."""
-    rpm_bins = ve_data['rpm_bins']
-    map_bins = ve_data['map_bins']
-    ve       = ve_data['ve']
+    rpm_bins   = ve_data['rpm_bins']
+    map_bins   = ve_data['map_bins']
+    ve         = ve_data['ve']
     tps_thresh = ae_cfg.get('tpsThresh') or 20.0
+    history    = history or []
 
     # Separar muestras
     ae_on  = [r for r in rows if r['accel_pw'] > 0.05]
@@ -177,23 +204,36 @@ def analyze(rows: list, ve_data: dict, ae_cfg: dict, min_samples: int = 5) -> di
     lean_cells = []
     rich_cells = []
     ok_cells   = []
+    skipped    = []
 
     for (mi, ri), afrs in sorted(cell_afrs.items()):
-        if len(afrs) < min_samples:
+        m   = map_bins[mi]
+        r   = rpm_bins[ri]
+        req = zone_min_samples(m, min_samples)
+        if len(afrs) < req:
             continue
-        avg  = sum(afrs) / len(afrs)
-        m    = map_bins[mi]
-        r    = rpm_bins[ri]
-        tgt  = target_afr(m)
-        vc   = ve[mi][ri]
-        vn   = round(vc * avg / tgt)
-        delta = vn - vc
+
+        avg   = sum(afrs) / len(afrs)
+        tgt   = target_afr(m)
+        vc    = ve[mi][ri]
+        raw_delta = vc * avg / tgt - vc
+        damp  = cell_damping(mi, ri, history)
+        delta = round(raw_delta * damp)
+        vn    = int(vc) + delta
 
         entry = {
             'mi': mi, 'ri': ri, 'map': m, 'rpm': r,
             'afr_avg': avg, 'target': tgt, 'n': len(afrs),
             've_cur': vc, 've_new': vn, 'delta': delta,
+            'damped': damp < 1.0,
         }
+
+        # Dead band: ignorar correcciones menores a 2 VE (ruido, no señal)
+        if abs(delta) < 2:
+            ok_cells.append(entry)
+            if abs(delta) >= 1:
+                skipped.append(entry)   # delta real pero amortiguado a 0
+            continue
 
         if avg > 14.5:
             lean_cells.append(entry)
@@ -221,11 +261,12 @@ def analyze(rows: list, ve_data: dict, ae_cfg: dict, min_samples: int = 5) -> di
     }
 
     return {
-        'lean': lean_cells,
-        'rich': rich_cells,
-        'ok':   ok_cells,
-        'ae':   ae_stats,
-        'rows': rows,
+        'lean':    lean_cells,
+        'rich':    rich_cells,
+        'ok':      ok_cells,
+        'skipped': skipped,
+        'ae':      ae_stats,
+        'rows':    rows,
     }
 
 
@@ -290,6 +331,15 @@ def print_report(result: dict, ae_cfg: dict, log_files: list, ve_data: dict):
     if not lean and not rich:
         print("  ✓ Sin zonas fuera de objetivo. Mezcla dentro de rango.\n")
 
+    skipped = result.get('skipped', [])
+    if skipped:
+        print(f"── IGNORADAS (dead band / amortiguadas) — {len(skipped)} celdas ──")
+        for c in sorted(skipped, key=lambda x: (x['map'], x['rpm'])):
+            damp_tag = ' [amortiguada]' if c.get('damped') else ''
+            print(f"  MAP={c['map']:5.0f} RPM={c['rpm']:5d}  "
+                  f"AFR={c['afr_avg']:.2f}  Δ={c['delta']:+d}{damp_tag}")
+        print()
+
 
 # ─────────────────────────────────────────────
 # 4. GENERACIÓN DEL .table CORREGIDO
@@ -339,7 +389,163 @@ def generate_table(result: dict, ve_data: dict, out_path: str):
 
 
 # ─────────────────────────────────────────────
-# 5. SELECCIÓN INTERACTIVA
+# 5. HISTORIAL DE CORRECCIONES
+# ─────────────────────────────────────────────
+
+def _parse_table_file(path: str) -> dict | None:
+    """Lee bins y valores VE de un .table XML."""
+    with open(path) as f:
+        content = f.read()
+    xa = re.search(r'<xAxis[^>]*>(.*?)</xAxis>', content, re.DOTALL)
+    ya = re.search(r'<yAxis[^>]*>(.*?)</yAxis>', content, re.DOTALL)
+    za = re.search(r'<zValues[^>]*>(.*?)</zValues>', content, re.DOTALL)
+    if not (xa and ya and za):
+        return None
+    rpm_bins = [int(float(x)) for x in re.findall(r'[\d.]+', xa.group(1))]
+    map_bins = [float(x)      for x in re.findall(r'[\d.]+', ya.group(1))]
+    values   = [float(x)      for x in re.findall(r'[\d.]+', za.group(1))]
+    return {'rpm_bins': rpm_bins, 'map_bins': map_bins, 'values': values}
+
+
+def _ts_from_filename(path: str) -> str:
+    """Extrae timestamp legible del nombre del archivo."""
+    name = os.path.basename(path)
+    m = re.search(r'_(\d{4}-\d{2}-\d{2})_(\d{2}[.:]\d{2})', name)
+    if m:
+        return f"{m.group(1)} {m.group(2).replace('.', ':')}"
+    return name
+
+
+def load_history_from_tables(project_dir: str, table_num: int) -> list:
+    """
+    Reconstruye historial comparando archivos veTable{N}Tbl_*.table consecutivos.
+    Cada par donde difieren celdas = una sesión de correcciones.
+    Retorna lista ordenada de más antiguo a más reciente.
+    """
+    pattern = os.path.join(project_dir, f'veTable{table_num}Tbl_*.table')
+    files   = sorted(glob.glob(pattern), key=os.path.getmtime)
+    if len(files) < 2:
+        return []
+
+    sessions = []
+    prev = _parse_table_file(files[0])
+
+    for path in files[1:]:
+        curr = _parse_table_file(path)
+        if not prev or not curr:
+            prev = curr
+            continue
+        if len(prev['values']) != len(curr['values']):
+            prev = curr
+            continue
+
+        n_cols = len(curr['rpm_bins'])
+        changed = []
+        for idx, (v_old, v_new) in enumerate(zip(prev['values'], curr['values'])):
+            if abs(v_new - v_old) >= 0.5:
+                mi = idx // n_cols
+                ri = idx % n_cols
+                changed.append({
+                    'mi':        mi,
+                    'ri':        ri,
+                    'map':       curr['map_bins'][mi],
+                    'rpm':       curr['rpm_bins'][ri],
+                    'reason':    'lean' if v_new > v_old else 'rich',
+                    've_before': v_old,
+                    've_after':  v_new,
+                    'delta':     v_new - v_old,
+                })
+
+        if changed:
+            sessions.append({
+                'timestamp':  _ts_from_filename(path),
+                'table_file': os.path.basename(path),
+                'corrections': changed,
+            })
+        prev = curr
+
+    return sessions
+
+
+def check_effectiveness(result: dict, history: list) -> list:
+    """
+    Para cada sesión del historial, evalúa el estado actual de las celdas
+    corregidas usando el análisis actual.
+    """
+    current = {}
+    for c in result['lean'] + result['rich'] + result['ok']:
+        current[(c['mi'], c['ri'])] = c
+
+    sessions = []
+    for rec in reversed(history):  # más reciente primero
+        cells = []
+        for c in rec['corrections']:
+            now   = current.get((c['mi'], c['ri']))
+            entry = {
+                'map':       c['map'],
+                'rpm':       c['rpm'],
+                'reason':    c['reason'],
+                've_before': c['ve_before'],
+                've_after':  c['ve_after'],
+                'target':    target_afr(c['map']),
+            }
+            if now:
+                afr_now  = round(now['afr_avg'], 2)
+                tgt      = entry['target']
+                in_range = abs(afr_now - tgt) <= 0.5
+                # La dirección esperada: lean→AFR bajó, rich→AFR subió
+                moved_right = (c['reason'] == 'lean' and afr_now < c['ve_before'] + 99) or True
+                if in_range:
+                    status = 'OK'
+                elif (c['reason'] == 'lean'  and afr_now < 14.5) or \
+                     (c['reason'] == 'rich'  and afr_now > 13.0):
+                    status = 'mejorando'
+                elif (c['reason'] == 'lean'  and afr_now > 14.5) or \
+                     (c['reason'] == 'rich'  and afr_now < 13.0):
+                    status = 'pendiente'
+                else:
+                    status = 'sin cambio'
+                entry['afr_now'] = afr_now
+                entry['n_now']   = now['n']
+                entry['status']  = status
+            else:
+                entry['afr_now'] = None
+                entry['n_now']   = 0
+                entry['status']  = 'sin datos'
+            cells.append(entry)
+
+        sessions.append({
+            'timestamp':  rec['timestamp'],
+            'table_file': rec['table_file'],
+            'cells':      cells,
+        })
+
+    return sessions
+
+
+def print_effectiveness(sessions: list):
+    """Imprime sección de efectividad de correcciones anteriores."""
+    if not sessions:
+        return
+    STATUS_ICON = {'OK': '✓', 'mejorando': '↑', 'pendiente': '→',
+                   'sin cambio': '~', 'sin datos': '?'}
+    print("── EFECTIVIDAD CORRECCIONES PREVIAS ─────────────────")
+    for s in sessions:
+        print(f"  {s['timestamp']}  →  {s['table_file']}")
+        print(f"  {'MAP':>5} {'RPM':>6} {'VE Δ':>6} {'AFR_ahora':>10} "
+              f"{'Target':>7}  Estado")
+        print("  " + "-"*56)
+        for c in s['cells']:
+            delta_str  = f"{c['ve_after'] - c['ve_before']:>+.1f}"
+            afr_str    = f"{c['afr_now']:>10.2f}" if c['afr_now'] else "  sin datos"
+            icon       = STATUS_ICON.get(c['status'], '?')
+            print(f"  {c['map']:>5.0f} {c['rpm']:>6} {delta_str:>6} "
+                  f"{afr_str} {c['target']:>7.1f}  {icon} {c['status']}")
+        print()
+
+
+# ─────────────────────────────────────────────
+# 6. SELECCIÓN INTERACTIVA
 # ─────────────────────────────────────────────
 
 def select_logs_interactive(log_dir: str) -> list:
@@ -377,7 +583,7 @@ def select_logs_interactive(log_dir: str) -> list:
 
 
 # ─────────────────────────────────────────────
-# 6. MAIN
+# 7. MAIN
 # ─────────────────────────────────────────────
 
 def main():
@@ -430,6 +636,9 @@ def main():
     ve_data = load_ve_table(msq_path, table_num)
     ae_cfg  = load_ae_config(msq_path)
 
+    # ── Cargar historial desde .table files ──
+    history = load_history_from_tables(project_dir, table_num)
+
     # ── Parsear logs ──
     print(f"\nParsando {len(log_files)} log(s)...")
     rows = load_msl_logs(log_files)
@@ -438,10 +647,15 @@ def main():
         sys.exit(1)
 
     # ── Análisis ──
-    result = analyze(rows, ve_data, ae_cfg, min_samples=args.min_samples)
+    result = analyze(rows, ve_data, ae_cfg, min_samples=args.min_samples, history=history)
 
     # ── Reporte ──
     print_report(result, ae_cfg, log_files, ve_data)
+
+    # ── Efectividad de correcciones previas ──
+    if history:
+        sessions = check_effectiveness(result, history)
+        print_effectiveness(sessions)
 
     # ── Generar .table corregido ──
     if result['lean'] or result['rich']:
