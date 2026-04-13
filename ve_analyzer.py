@@ -421,8 +421,11 @@ def load_history_from_tables(project_dir: str, table_num: int) -> list:
     Cada par donde difieren celdas = una sesión de correcciones.
     Retorna lista ordenada de más antiguo a más reciente.
     """
-    pattern = os.path.join(project_dir, f'veTable{table_num}Tbl_*.table')
-    files   = sorted(glob.glob(pattern), key=os.path.getmtime)
+    all_files = sorted(glob.glob(
+        os.path.join(project_dir, f'veTable{table_num}Tbl_*.table')
+    ), key=os.path.getmtime)
+    # Excluir _smoothed.table — son outputs, no sesiones de calibración
+    files = [f for f in all_files if '_smoothed' not in os.path.basename(f)]
     if len(files) < 2:
         return []
 
@@ -464,6 +467,153 @@ def load_history_from_tables(project_dir: str, table_num: int) -> list:
         prev = curr
 
     return sessions
+
+
+def smooth_table(project_dir: str, table_num: int) -> None:
+    """
+    Suaviza la tabla VE usando el historial completo de _corrected.table.
+
+    Estrategia de confianza por frecuencia:
+    - Cuenta cuántas sesiones corrigieron cada celda → freq[mi][ri]
+    - Celdas con freq ≥ anchor_threshold: ANCLADAS (no cambian)
+    - Celdas con freq < anchor_threshold: mezcla ponderada hacia el promedio
+      de vecinos 3x3 (más blend cuanto menor la frecuencia)
+    - alpha (mezcla hacia vecinos) = 1 − freq / anchor_threshold
+      → freq=0: alpha=1.0 (100% vecinos)
+      → freq=1: alpha=0.67 (66% vecinos)
+      → freq≥threshold: alpha=0.0 (anclada)
+    - Se aplican PASSES pasadas para propagar suavizado a zonas adyacentes.
+    """
+    pattern  = os.path.join(project_dir, f'veTable{table_num}Tbl_*_corrected.table')
+    files    = sorted(glob.glob(pattern), key=os.path.getmtime)
+
+    if not files:
+        print("No se encontraron archivos _corrected.table en el directorio.")
+        return
+
+    latest = _parse_table_file(files[-1])
+    if not latest:
+        print(f"Error leyendo {files[-1]}")
+        return
+
+    n_cols = len(latest['rpm_bins'])
+    n_rows = len(latest['map_bins'])
+
+    # ── Mapa de frecuencia de correcciones por celda ──
+    history = load_history_from_tables(project_dir, table_num)
+    freq = [[0] * n_cols for _ in range(n_rows)]
+    for session in history:
+        for c in session['corrections']:
+            mi, ri = c['mi'], c['ri']
+            if 0 <= mi < n_rows and 0 <= ri < n_cols:
+                freq[mi][ri] += 1
+
+    n_sessions     = len(history)
+    # Una celda se considera "establecida" si fue corregida en al menos 1/3
+    # de las sesiones (mínimo 2 para evitar que una sola sesión ancle todo).
+    anchor_threshold = max(2, n_sessions // 3)
+
+    n_anchored  = sum(freq[mi][ri] >= anchor_threshold
+                      for mi in range(n_rows) for ri in range(n_cols))
+    n_blend     = sum(0 < freq[mi][ri] < anchor_threshold
+                      for mi in range(n_rows) for ri in range(n_cols))
+    n_zero      = sum(freq[mi][ri] == 0
+                      for mi in range(n_rows) for ri in range(n_cols))
+    n_total     = n_rows * n_cols
+
+    print(f"\n── SUAVIZADO DE TABLA VE ─────────────────────────────")
+    print(f"  Base:                       {os.path.basename(files[-1])}")
+    print(f"  Sesiones en historial:      {n_sessions}")
+    print(f"  Umbral de anclaje:          {anchor_threshold} sesiones")
+    print(f"  Celdas ancladas (f≥{anchor_threshold}):    {n_anchored}/{n_total}")
+    print(f"  Celdas mezcla parcial:      {n_blend}/{n_total}")
+    print(f"  Celdas sin historial (f=0): {n_zero}/{n_total}")
+
+    # ── Reconstruir grid 2D de valores ──
+    ve = [[latest['values'][mi * n_cols + ri] for ri in range(n_cols)]
+          for mi in range(n_rows)]
+
+    # ── Suavizado con mezcla ponderada por confianza ──
+    # Se aplican múltiples pasadas para propagar el suavizado gradualmente.
+    PASSES = 5
+    for _pass in range(PASSES):
+        ve_next = [row[:] for row in ve]
+
+        for mi in range(n_rows):
+            for ri in range(n_cols):
+                alpha = max(0.0, 1.0 - freq[mi][ri] / anchor_threshold)
+                if alpha == 0.0:
+                    continue  # anclada
+
+                # Promedio ponderado por distancia inversa de vecinos 3x3
+                total_w = 0.0
+                total_v = 0.0
+                for dmi in (-1, 0, 1):
+                    for dri in (-1, 0, 1):
+                        if dmi == 0 and dri == 0:
+                            continue
+                        nmi, nri = mi + dmi, ri + dri
+                        if 0 <= nmi < n_rows and 0 <= nri < n_cols:
+                            dist = (dmi ** 2 + dri ** 2) ** 0.5
+                            w = 1.0 / dist
+                            total_w += w
+                            total_v += ve[nmi][nri] * w
+
+                if total_w > 0:
+                    neighbor_avg = total_v / total_w
+                    blended = ve[mi][ri] * (1.0 - alpha) + neighbor_avg * alpha
+                    ve_next[mi][ri] = round(blended, 1)
+
+        ve = ve_next
+
+    # ── Calcular delta total aplicado ──
+    orig = [[latest['values'][mi * n_cols + ri] for ri in range(n_cols)]
+            for mi in range(n_rows)]
+    changed_cells = [(mi, ri, orig[mi][ri], ve[mi][ri])
+                     for mi in range(n_rows) for ri in range(n_cols)
+                     if abs(ve[mi][ri] - orig[mi][ri]) >= 0.5]
+
+    print(f"\n  Pasadas de suavizado:       {PASSES}")
+    print(f"  Celdas modificadas (≥0.5):  {len(changed_cells)}/{n_total}")
+    if changed_cells:
+        deltas = [abs(v_new - v_old) for _, _, v_old, v_new in changed_cells]
+        print(f"  Delta promedio:             {sum(deltas)/len(deltas):.1f}")
+        print(f"  Delta máximo:               {max(deltas):.1f}")
+
+    # ── Guardar _smoothed.table ──
+    ts  = datetime.now().strftime('%Y-%m-%d_%H.%M')
+    out = os.path.join(project_dir, f'veTable{table_num}Tbl_{ts}_smoothed.table')
+
+    z_rows = "\n".join(
+        "         " + " ".join(f"{v:.1f}" for v in row) + " "
+        for row in ve
+    )
+    now_str = datetime.now().strftime("%a %b %d %H:%M:%S CLST %Y")
+
+    xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="no"?>\n'
+        '<tableData xmlns="http://www.EFIAnalytics.com/:table">\n'
+        f'<bibliography author="EFI Analytics - philip.tobin@yahoo.com"'
+        f' company="EFI Analytics, copyright 2010, All Rights Reserved."'
+        f' writeDate="{now_str}"/>\n'
+        '<versionInfo fileFormat="1.0"/>\n'
+        f'<table cols="{n_cols}" rows="{n_rows}">\n'
+        f'<xAxis cols="{n_cols}" name="rpm">\n'
+        + "\n".join(f"         {r} " for r in latest['rpm_bins']) + "\n"
+        '      </xAxis>\n'
+        f'<yAxis name="fuelload" rows="{n_rows}">\n'
+        + "\n".join(f"         {m} " for m in latest['map_bins']) + "\n"
+        '      </yAxis>\n'
+        f'<zValues cols="{n_cols}" rows="{n_rows}">\n'
+        f'{z_rows}\n'
+        '      </zValues>\n'
+        '</table>\n'
+        '</tableData>\n'
+    )
+    with open(out, 'w') as f:
+        f.write(xml)
+
+    print(f"\n  Tabla suavizada guardada: {os.path.basename(out)}")
 
 
 def check_effectiveness(result: dict, history: list) -> list:
@@ -1197,12 +1347,19 @@ def main():
                         help='Omitir el reporte de diagnóstico de salud')
     parser.add_argument('--health-only', action='store_true',
                         help='Solo mostrar diagnóstico de salud, sin análisis VE')
+    parser.add_argument('--smooth', action='store_true',
+                        help='Suavizar tabla VE usando historial de _corrected.table')
     args = parser.parse_args()
 
     project_dir = os.path.dirname(os.path.abspath(__file__))
     log_dir     = os.path.join(project_dir, args.log_dir)
     msq_path    = os.path.join(project_dir, args.msq)
     table_num   = args.table_num
+
+    # ── Suavizado de tabla (no requiere logs) ──
+    if args.smooth:
+        smooth_table(project_dir, table_num)
+        return
 
     # ── Selección de logs ──
     if args.logs:
