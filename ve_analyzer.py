@@ -6,11 +6,10 @@ Uso:
   python3 ve_analyzer.py                    # modo interactivo
   python3 ve_analyzer.py --latest 3         # últimos N logs
   python3 ve_analyzer.py --logs f1.msl f2.msl
-  python3 ve_analyzer.py --table mi_ve.table --latest 2
+  python3 ve_analyzer.py --save-report      # guarda reporte de salud como .md
 
 Requiere en el mismo directorio:
   - CurrentTune.msq    (configuración activa: AE, etc.)
-  - Un archivo .table  (tabla VE actual exportada desde TunerStudio)
   - DataLogs/*.msl     (logs de datos)
 """
 
@@ -545,7 +544,596 @@ def print_effectiveness(sessions: list):
 
 
 # ─────────────────────────────────────────────
-# 6. SELECCIÓN INTERACTIVA
+# 6. DIAGNÓSTICO DE SALUD
+# ─────────────────────────────────────────────
+
+def load_msl_full(log_files: list) -> list:
+    """
+    Parsea logs .msl capturando todas las columnas relevantes para
+    diagnóstico de salud (sin filtrar por CLT ni AFR).
+    Retorna lista de dicts con claves normalizadas.
+    """
+    FLOAT_COLS = {
+        'RPM':                        'rpm',
+        'MAP':                        'map',
+        'AFR':                        'afr',
+        'TPS':                        'tps',
+        'CLT':                        'clt',
+        'MAT':                        'mat',
+        'Batt V':                     'batt',
+        'SPK: Spark Advance':         'adv',
+        'SPK: Knock retard':          'knock_retard',
+        'SPK: MAT Retard':            'mat_retard',
+        'SPK: Cold advance':          'cold_adv',
+        'SPK: Idle Correction Advance': 'idle_corr_adv',
+        'Fuel: Accel enrich':         'ae_pct',
+        'Fuel: Warmup cor':           'wue',
+        'Dwell':                      'dwell',
+        'DutyCycle1':                 'duty_cycle',
+        'PWM Idle Duty':              'iac_duty',
+        'Lost Sync Count':            'lost_sync',
+        'Timing Err%':                'timing_err',
+        'Barometer':                  'baro',
+        'TPSdot':                     'tpsdot',
+        'MAPdot':                     'mapdot',
+        'Accel PW':                   'accel_pw',
+    }
+    all_rows = []
+    for fname in log_files:
+        with open(fname, 'rb') as fh:
+            raw = fh.read()
+        text_start = raw.find(b'Time')
+        if text_start < 0:
+            continue
+        text  = raw[text_start:].decode('latin-1', errors='replace')
+        lines = text.split('\n')
+        if len(lines) < 3:
+            continue
+        headers = lines[0].strip().split('\t')
+        cols    = {h.strip(): i for i, h in enumerate(headers)}
+
+        for line in lines[2:]:
+            parts = line.strip().split('\t')
+            if len(parts) < 5:
+                continue
+            row = {}
+            for col_name, key in FLOAT_COLS.items():
+                if col_name in cols:
+                    try:
+                        row[key] = float(parts[cols[col_name]])
+                    except (ValueError, IndexError):
+                        row[key] = None
+                else:
+                    row[key] = None
+            all_rows.append(row)
+
+    return all_rows
+
+
+def _pct(count, total):
+    return 100.0 * count / total if total > 0 else 0.0
+
+
+def _mean(vals):
+    return sum(vals) / len(vals) if vals else 0.0
+
+
+def _stdev(vals):
+    if len(vals) < 2:
+        return 0.0
+    m = _mean(vals)
+    return (sum((v - m) ** 2 for v in vals) / len(vals)) ** 0.5
+
+
+def analyze_health(rows: list) -> dict:
+    """
+    Analiza métricas de salud del motor con filtros contextuales.
+    Cada métrica se evalúa solo en las condiciones donde tiene sentido.
+    """
+    n_total = len(rows)
+
+    def fv(key, subset=None):
+        src = subset if subset is not None else rows
+        return [r[key] for r in src if r.get(key) is not None]
+
+    # ── Segmentos base reutilizables ──
+    # Motor en marcha (no cranking)
+    running   = [r for r in rows if (r.get('rpm') or 0) > 600]
+    # Cranking: motor intentando arrancar
+    cranking  = [r for r in rows if 50 < (r.get('rpm') or 0) <= 600]
+    # Motor caliente en marcha
+    warm_run  = [r for r in running if (r.get('clt') or 0) > 70]
+    # Motor frío en marcha (incluye calentamiento)
+    cold_run  = [r for r in rows if 200 < (r.get('rpm') or 0) and (r.get('clt') or 99) < 60]
+
+    health = {}
+
+    # ── VOLTAJE ──
+    # Solo evaluado con motor en marcha — cranking siempre baja voltaje (normal)
+    batt_run  = fv('batt', running)
+    batt_warm = fv('batt', warm_run)
+    batt_all  = fv('batt')
+    health['voltage'] = {
+        'n':              len(batt_all),
+        'avg_running':    _mean(batt_run),
+        'min_running':    min(batt_run)  if batt_run  else None,
+        'max_running':    max(batt_run)  if batt_run  else None,
+        'min_all':        min(batt_all)  if batt_all  else None,
+        # Bajo voltaje con motor caliente y en marcha = problema real
+        'low_warm':       sum(1 for v in batt_warm if v < 13.0),
+        'low_warm_pct':   _pct(sum(1 for v in batt_warm if v < 13.0), len(batt_warm)),
+        'very_low_warm':  sum(1 for v in batt_warm if v < 12.5),
+        # Bajo voltaje en cranking: solo informativo
+        'low_cranking':   sum(1 for v in fv('batt', cranking) if v < 11.0),
+    }
+
+    # ── CLT ──
+    clt = fv('clt')
+    health['clt'] = {
+        'avg': _mean(clt),
+        'min': min(clt) if clt else None,
+        'max': max(clt) if clt else None,
+        'above_100': sum(1 for v in fv('clt', running) if v > 100),
+        'above_95':  sum(1 for v in fv('clt', running) if v > 95),
+    }
+
+    # ── MAT ──
+    # La MAT alta solo es relevante con motor en marcha sostenida
+    mat_run = fv('mat', warm_run)
+    mat_all = fv('mat')
+    mat_retard = fv('mat_retard', warm_run)
+    health['mat'] = {
+        'avg_warm':       _mean(mat_run),
+        'max_warm':       max(mat_run) if mat_run else None,
+        'above_45_pct':   _pct(sum(1 for v in mat_run if v > 45), len(mat_run)),
+        'above_55_pct':   _pct(sum(1 for v in mat_run if v > 55), len(mat_run)),
+        'retard_active':  sum(1 for v in mat_retard if v > 0.5),
+        'retard_max':     max(mat_retard) if mat_retard else 0,
+        'threshold_71':   (max(mat_run) if mat_run else 0) < 71,
+    }
+
+    # ── IGNICIÓN ──
+    # Timing error solo cuenta con motor en marcha normal (no cranking)
+    adv_run    = fv('adv', running)
+    knock_run  = fv('knock_retard', running)
+    te_run     = fv('timing_err', running)   # solo en marcha, no cranking
+    high_te    = [v for v in te_run if abs(v) > 5]
+    health['ignition'] = {
+        'adv_avg':             _mean(adv_run),
+        'adv_min':             min(adv_run) if adv_run else None,
+        'adv_max':             max(adv_run) if adv_run else None,
+        'knock_events':        sum(1 for v in knock_run if v > 0),
+        'timing_err_max':      max(abs(v) for v in te_run) if te_run else 0,
+        'timing_err_high':     len(high_te),
+        'timing_err_high_pct': _pct(len(high_te), len(te_run)),
+    }
+
+    # ── SYNC / TRIGGER ──
+    # Tres zonas: engine off (RPM=0), cranking (1-600), running (>600)
+    sync_off      = 0   # motor apagado — normal
+    sync_cranking = 0   # cranking — algo esperado
+    sync_running  = 0   # en marcha — problemático
+    prev_sc = 0
+    for r in rows:
+        sc  = r.get('lost_sync')
+        rpm = r.get('rpm') or 0
+        if sc is not None and sc > prev_sc:
+            if   rpm == 0:    sync_off      += 1
+            elif rpm <= 600:  sync_cranking  += 1
+            else:             sync_running   += 1
+            prev_sc = sc
+        elif sc is not None:
+            prev_sc = sc
+
+    sync_vals = fv('lost_sync')
+    health['sync'] = {
+        'max_count':    max(sync_vals) if sync_vals else 0,
+        'events_off':      sync_off,
+        'events_cranking': sync_cranking,
+        'events_running':  sync_running,
+    }
+
+    # ── RALENTÍ ESTABLE (CLT>70, TPS<3%, RPM 600-1200, AE ~100%, MAP estable) ──
+    # Excluimos: AE activo (transitorio), MAPdot alto (carga cambiando),
+    # y los primeros instantes tras desaceleración (MAPdot muy negativo)
+    idle_rows = [r for r in rows
+                 if 600  < (r.get('rpm')    or 0)   < 1200
+                 and       (r.get('tps')    or 99)  < 3
+                 and       (r.get('clt')    or 0)   > 70
+                 and       (r.get('ae_pct') or 100) < 106   # sin AE activo
+                 and abs(  (r.get('mapdot') or 0))  < 15]   # MAP estable
+
+    idle_rpms = fv('rpm', idle_rows)
+    # AFR solo en condiciones verdaderamente estables (sin AE, MAP plano)
+    idle_afrs = [r['afr'] for r in idle_rows
+                 if r.get('afr') and 10 < r['afr'] < 20]
+    idle_iac  = fv('iac_duty', idle_rows)
+    idle_adv  = fv('adv', idle_rows)
+    idle_corr = fv('idle_corr_adv', idle_rows)
+
+    # Caídas de RPM en ralentí estable (excluye desaceleraciones)
+    # Una caída real es cuando el RPM baja mientras ya estaba en ralentí quieto
+    dips_real = sum(1 for v in idle_rpms if v < 750)
+
+    # Swings RPM en ventana deslizante de 10 lecturas
+    swing_count = 0
+    for i in range(5, len(idle_rpms) - 5):
+        window = idle_rpms[i - 5:i + 5]
+        if max(window) - min(window) > 150:
+            swing_count += 1
+
+    # Idle Correction: ¿cuánto corrige y si el RPM sigue inestable a pesar de eso?
+    idle_corr_big = [v for v in idle_corr if abs(v) > 3]
+
+    health['idle'] = {
+        'n':                    len(idle_rows),
+        'rpm_avg':              _mean(idle_rpms),
+        'rpm_std':              _stdev(idle_rpms),
+        'rpm_min':              min(idle_rpms) if idle_rpms else None,
+        'rpm_max':              max(idle_rpms) if idle_rpms else None,
+        'rpm_dips':             dips_real,
+        'rpm_dips_pct':         _pct(dips_real, len(idle_rpms)),
+        'swings_pct':           _pct(swing_count, len(idle_rpms)),
+        'afr_avg':              _mean(idle_afrs),
+        'afr_lean_pct':         _pct(sum(1 for v in idle_afrs if v > 15.5), len(idle_afrs)),
+        'afr_rich_pct':         _pct(sum(1 for v in idle_afrs if v < 13.0), len(idle_afrs)),
+        'iac_avg':              _mean(idle_iac),
+        'idle_corr_active_pct': _pct(sum(1 for v in idle_corr if abs(v) > 0.5), len(idle_corr)),
+        'idle_corr_big_pct':    _pct(len(idle_corr_big), len(idle_corr)),
+        'idle_corr_max':        max((abs(v) for v in idle_corr), default=0),
+        'adv_avg':              _mean(idle_adv),
+    }
+
+    # ── COLD START (CLT<50°C, motor en marcha, excluye cranking) ──
+    # Solo contamos AFR una vez que el motor ya está corriendo (RPM > 600)
+    # para excluir el enriquecimiento de cranking que es puramente mecánico
+    cold_rows = [r for r in rows
+                 if (r.get('rpm') or 0) > 600
+                 and (r.get('clt') or 99) < 50]
+    cold_afrs = [r['afr'] for r in cold_rows
+                 if r.get('afr') and 10 < r['afr'] < 20]
+    cold_wue  = fv('wue', cold_rows)
+    cold_adv  = fv('cold_adv', cold_rows)
+    health['cold_start'] = {
+        'n':            len(cold_rows),
+        'afr_avg':      _mean(cold_afrs),
+        'afr_lean_pct': _pct(sum(1 for v in cold_afrs if v > 14.7), len(cold_afrs)),
+        'afr_rich_pct': _pct(sum(1 for v in cold_afrs if v < 13.0), len(cold_afrs)),
+        'wue_max':      max(cold_wue) if cold_wue else 0,
+        'cold_adv_max': max(cold_adv) if cold_adv else 0,
+    }
+
+    # ── AE ──
+    # Separamos AE durante aceleración real (MAPdot alto o TPSdot alto)
+    # de posibles disparos espurios (AE > 105% pero sin transición real)
+    ae_rows_all    = [r for r in running if (r.get('ae_pct') or 100) > 105]
+    ae_real        = [r for r in ae_rows_all
+                      if abs(r.get('mapdot') or 0) > 15
+                      or abs(r.get('tpsdot') or 0) > 20]
+    ae_spurious    = [r for r in ae_rows_all if r not in ae_real]
+    ae_vals_real   = fv('ae_pct', ae_real)
+    ae_vals_spur   = fv('ae_pct', ae_spurious)
+    health['ae'] = {
+        'total_running':    len(running),
+        'active_pct':       _pct(len(ae_rows_all), len(running)),
+        'real_events':      len(ae_real),
+        'spurious_events':  len(ae_spurious),
+        'max_real':         max(ae_vals_real) if ae_vals_real else 0,
+        'avg_real':         _mean(ae_vals_real),
+        'above_200_real':   sum(1 for v in ae_vals_real if v > 200),
+        'above_200_spur':   sum(1 for v in ae_vals_spur if v > 200),
+    }
+
+    # ── DWELL ──
+    # Dwell bajo solo es problema cuando el voltaje es normal
+    # Con voltaje bajo (< 12.5V) el battFac lo reduce intencionalmente
+    dwell_normal_v = [r for r in running
+                      if r.get('dwell') is not None
+                      and (r.get('batt') or 0) > 12.5]
+    dwell_vals = fv('dwell', dwell_normal_v)
+    health['dwell'] = {
+        'avg':          _mean(dwell_vals),
+        'min':          min(dwell_vals) if dwell_vals else None,
+        'max':          max(dwell_vals) if dwell_vals else None,
+        'below_2':      sum(1 for v in dwell_vals if v < 2.0),
+        'context':      'con voltaje normal (>12.5V)',
+    }
+
+    # ── INYECTORES ──
+    # DC alto solo importa a RPM donde el motor trabaja (> 1500 RPM)
+    dc_load  = fv('duty_cycle', [r for r in running if (r.get('rpm') or 0) > 1500])
+    dc_all   = fv('duty_cycle', running)
+    health['injectors'] = {
+        'avg':      _mean(dc_all),
+        'max_all':  max(dc_all)  if dc_all  else 0,
+        'max_load': max(dc_load) if dc_load else 0,
+        'above_80': sum(1 for v in dc_load if v > 80),
+        'above_90': sum(1 for v in dc_load if v > 90),
+    }
+
+    # ── RPM COBERTURA ──
+    rpm_run = fv('rpm', running)
+    health['rpm'] = {
+        'max_observed': max(rpm_run) if rpm_run else 0,
+        'above_4500':   sum(1 for v in rpm_run if v > 4500),
+        'above_5000':   sum(1 for v in rpm_run if v > 5000),
+    }
+
+    # ── BAROMETRO ──
+    baro = fv('baro', running)
+    health['baro'] = {
+        'avg':   _mean(baro),
+        'min':   min(baro) if baro else None,
+        'max':   max(baro) if baro else None,
+        'range': (max(baro) - min(baro)) if len(baro) > 1 else 0,
+    }
+
+    health['n_total'] = n_total
+    return health
+
+
+def _flag(condition, label_warn='⚠ REVISAR', label_ok='✓'):
+    return label_warn if condition else label_ok
+
+
+def _fmt_health_report(health: dict, log_files: list, timestamp: str) -> str:
+    """
+    Genera el texto completo del reporte de salud con contexto por condición.
+    """
+    lines = []
+    W = 60
+
+    def sec(title):
+        lines.append(f"\n── {title} {'─' * max(1, W - len(title) - 4)}")
+
+    def row(*parts):
+        lines.append('  ' + '  '.join(str(p) for p in parts))
+
+    def note(text):
+        lines.append(f"  → {text}")
+
+    lines.append('\n' + '═' * W)
+    lines.append('  DIAGNÓSTICO DE SALUD DEL MOTOR')
+    lines.append('═' * W)
+    lines.append(f"  Fecha    : {timestamp}")
+    lines.append(f"  Logs     : {len(log_files)} archivo(s)")
+    for f in log_files:
+        lines.append(f"             {os.path.basename(f)}")
+    lines.append(f"  Muestras : {health['n_total']:,} filas totales")
+
+    # ── VOLTAJE ──
+    sec('VOLTAJE DE BATERÍA')
+    v = health['voltage']
+    if v['avg_running'] is not None:
+        row(f"Motor en marcha — Prom: {v['avg_running']:.2f}V    "
+            f"Min: {v['min_running']:.2f}V    Max: {v['max_running']:.2f}V")
+        warn_low  = v['low_warm'] > 0
+        warn_vlow = v['very_low_warm'] > 0
+        row(f"< 13.0V con motor caliente (>70°C): {v['low_warm']:4d}   "
+            f"{_flag(warn_low)}")
+        if warn_vlow:
+            row(f"< 12.5V con motor caliente: {v['very_low_warm']:4d}   ⚠ CRÍTICO — "
+                f"impacta dwell e inyección")
+        if warn_low:
+            note("Alternador no está cargando correctamente en caliente")
+        if v['low_cranking'] > 0:
+            row(f"< 11.0V durante cranking: {v['low_cranking']} lecturas   "
+                f"(esperado — no es una falla)")
+        if v['min_all'] is not None and v['min_all'] < 10.5:
+            row(f"Voltaje mínimo absoluto registrado: {v['min_all']:.2f}V   "
+                f"(probablemente con motor apagado)")
+
+    # ── CLT ──
+    sec('TEMPERATURA MOTOR (CLT)')
+    c = health['clt']
+    if c['avg']:
+        row(f"Prom: {c['avg']:.1f}°C    Min: {c['min']:.1f}°C    Max: {c['max']:.1f}°C")
+        if c['above_100'] > 0:
+            row(f"SOBRECALENTAMIENTO > 100°C con motor en marcha: "
+                f"{c['above_100']} lecturas   ⚠ CRÍTICO")
+        elif c['above_95'] > 0:
+            row(f"Alta temperatura > 95°C con motor en marcha: "
+                f"{c['above_95']} lecturas   ⚠ REVISAR")
+        else:
+            row("Sin sobrecalentamiento detectado.   ✓")
+
+    # ── MAT ──
+    sec('TEMPERATURA AIRE (MAT)')
+    m = health['mat']
+    if m['avg_warm'] is not None:
+        row(f"Motor caliente — Prom: {m['avg_warm']:.1f}°C    Max: {m['max_warm']:.1f}°C")
+        warn_mat = m['above_55_pct'] > 20
+        row(f"> 45°C : {m['above_45_pct']:.1f}% del tiempo en caliente   "
+            f"> 55°C : {m['above_55_pct']:.1f}%   "
+            f"{_flag(warn_mat)}")
+        if warn_mat:
+            note("MAT alta sostenida — riesgo de detonación sin sensor de knock activo")
+        if m['retard_active'] > 0:
+            row(f"MAT Retard activo: {m['retard_active']} lecturas  "
+                f"(máx {m['retard_max']:.1f}°)   ✓")
+        elif m['threshold_71']:
+            row(f"MAT Retard: 0 lecturas — MAT máxima ({m['max_warm']:.1f}°C) "
+                f"no alcanza umbral de tabla (71°C)   (normal)")
+        else:
+            row("MAT Retard: 0 lecturas aunque MAT alcanza umbral — verificar configuración")
+
+    # ── IGNICIÓN ──
+    sec('IGNICIÓN / AVANCE  (solo motor en marcha, excluye cranking)')
+    ig = health['ignition']
+    if ig['adv_avg'] is not None:
+        row(f"Avance prom: {ig['adv_avg']:.1f}°    "
+            f"Min: {ig['adv_min']:.1f}°    Max: {ig['adv_max']:.1f}°")
+        warn_te = ig['timing_err_high'] > 30
+        row(f"Timing Error > 5% : {ig['timing_err_high']:4d} lecturas "
+            f"({ig['timing_err_high_pct']:.1f}%)    "
+            f"máx = {ig['timing_err_max']:.1f}%   "
+            f"{_flag(warn_te)}")
+        if warn_te:
+            note("Ruido en señal CAS/trigger — revisar blindaje, masa MS2")
+        if ig['knock_events'] > 0:
+            row(f"Knock retard activo: {ig['knock_events']} eventos   ⚠ DETONACIÓN DETECTADA")
+        else:
+            row("Knock retard: ningún evento   "
+                "(aviso: knock sensor desactivado en MSQ)")
+
+    # ── SYNC ──
+    sec('TRIGGER / SYNC')
+    s = health['sync']
+    row(f"Lost Sync en marcha (RPM>600)  : {s['events_running']:3d}   "
+        f"{_flag(s['events_running'] > 0)}")
+    row(f"Lost Sync en cranking (RPM≤600): {s['events_cranking']:3d}   "
+        f"{_flag(s['events_cranking'] > 2, '⚠ REVISAR', '(aceptable en arranques)')}")
+    row(f"Lost Sync con motor apagado    : {s['events_off']:3d}   (normal)")
+    if s['events_running'] > 0:
+        note("Sync perdido con motor en marcha — revisar cable CAS, masa, reluctor")
+
+    # ── RALENTÍ ──
+    sec('RALENTÍ CALIENTE  (CLT>70°C, TPS<3%, AE inactivo, MAP estable)')
+    i = health['idle']
+    if i['n'] > 10:
+        row(f"Muestras válidas: {i['n']:,}    RPM prom: {i['rpm_avg']:.0f}    "
+            f"std: {i['rpm_std']:.0f}    Min: {i['rpm_min']:.0f}    Max: {i['rpm_max']:.0f}")
+        warn_dips   = i['rpm_dips_pct'] > 1
+        warn_swings = i['swings_pct'] > 10
+        row(f"Caídas < 750 RPM (sin desaceleración): {i['rpm_dips']:4d} "
+            f"({i['rpm_dips_pct']:.1f}%)   {_flag(warn_dips)}")
+        row(f"Oscilaciones > 150 RPM: {i['swings_pct']:.1f}%   "
+            f"{_flag(warn_swings, '⚠ INESTABLE', '✓')}")
+        if warn_dips or warn_swings:
+            note("Ralentí inestable — revisar IAC, bypass mecánico, vacío")
+        # AFR: ya filtrado sin AE activo ni MAP cambiante
+        warn_afr = i['afr_rich_pct'] > 8 or i['afr_lean_pct'] > 8
+        row(f"AFR en ralentí limpio — prom: {i['afr_avg']:.2f}    "
+            f"Lean >15.5: {i['afr_lean_pct']:.1f}%    "
+            f"Rico <13.0: {i['afr_rich_pct']:.1f}%   "
+            f"{_flag(warn_afr)}")
+        if warn_afr:
+            note("AFR filtrado sin AE ni transitorios — revisar celdas VE de ralentí")
+        # IAC
+        row(f"IAC Duty prom: {i['iac_avg']:.1f}%   "
+            f"(open-loop warmup cierra IAC en caliente — informativo)")
+        # Idle Correction Advance
+        warn_ic = i['idle_corr_big_pct'] > 20
+        row(f"Idle Correction Advance > 3°: {i['idle_corr_big_pct']:.1f}% del tiempo  "
+            f"máx: {i['idle_corr_max']:.1f}°   "
+            f"{_flag(warn_ic, '⚠ timing compensando base de ralentí', '✓')}")
+        row(f"Avance ignición promedio en ralentí: {i['adv_avg']:.1f}°")
+    elif i['n'] > 0:
+        row(f"Pocas muestras de ralentí estable ({i['n']}) — insuficiente para análisis")
+    else:
+        row("Sin datos de ralentí caliente en estos logs.")
+
+    # ── COLD START ──
+    sec('ARRANQUE EN FRÍO  (CLT<50°C, RPM>600, motor ya corriendo)')
+    cs = health['cold_start']
+    if cs['n'] > 20:
+        row(f"Muestras: {cs['n']:,}")
+        warn_cs = cs['afr_rich_pct'] > 25 or cs['afr_lean_pct'] > 10
+        row(f"AFR prom: {cs['afr_avg']:.2f}    "
+            f"Lean >14.7: {cs['afr_lean_pct']:.1f}%    "
+            f"Rico <13.0: {cs['afr_rich_pct']:.1f}%   "
+            f"{_flag(warn_cs)}")
+        row(f"WUE max: {cs['wue_max']:.0f}%    Cold Advance max: {cs['cold_adv_max']:.1f}°")
+        if cs['afr_lean_pct'] > 10:
+            note("Mezcla pobre en frío — puede causar fallas de arranque")
+        if cs['afr_rich_pct'] > 25:
+            note("Mezcla muy rica en frío — WUE o ASE posiblemente alto")
+    elif cs['n'] > 0:
+        row(f"Pocas muestras en frío ({cs['n']}) — insuficiente para análisis")
+    else:
+        row("Sin datos de arranque en frío en estos logs.")
+
+    # ── AE ──
+    sec('ACELERACIÓN ENRICHMENT (AE)')
+    ae = health['ae']
+    row(f"AE activo (>105%) : {ae['active_pct']:.1f}% del tiempo en marcha")
+    row(f"Aceleraciones reales detectadas (MAPdot>15 o TPSdot>20): {ae['real_events']}")
+    if ae['real_events'] > 0:
+        row(f"  AE max en aceleración real: {ae['max_real']:.0f}%    "
+            f"Prom: {ae['avg_real']:.0f}%    "
+            f"Eventos >200%: {ae['above_200_real']}   "
+            f"{_flag(ae['above_200_real'] > 10)}")
+    if ae['spurious_events'] > 0:
+        warn_spur = ae['above_200_spur'] > 0
+        row(f"AE sin transición detectada (posible ruido): {ae['spurious_events']} lecturas   "
+            f"{_flag(warn_spur)}")
+        if warn_spur:
+            note("AE > 200% sin aceleración real — revisar señal TPS o MAP")
+
+    # ── DWELL ──
+    sec('DWELL BOBINAS  (solo con voltaje >12.5V — battFac excluido)')
+    d = health['dwell']
+    if d['min'] is not None:
+        row(f"Prom: {d['avg']:.2f}ms    Min: {d['min']:.2f}ms    Max: {d['max']:.2f}ms   "
+            f"{_flag(d['below_2'] > 0)}")
+        if d['below_2'] > 0:
+            note(f"{d['below_2']} lecturas < 2.0ms a voltaje normal — revisar battFac")
+    else:
+        row("Sin datos de dwell con voltaje normal.")
+
+    # ── INYECTORES ──
+    sec('INYECTORES (DUTY CYCLE)')
+    inj = health['injectors']
+    row(f"Prom (en marcha): {inj['avg']:.1f}%    "
+        f"Máx (>1500 RPM): {inj['max_load']:.1f}%   "
+        f"{_flag(inj['max_load'] > 80, '⚠ REVISAR', '✓ lejos de saturación')}")
+    if inj['above_80'] > 0:
+        row(f"DC > 80% a carga (>1500 RPM): {inj['above_80']}    "
+            f"DC > 90%: {inj['above_90']}")
+        note("Inyectores cerca de saturación — considerar inyectores más grandes")
+
+    # ── RPM COBERTURA ──
+    sec('COBERTURA RPM')
+    r = health['rpm']
+    warn_cov = r['max_observed'] < 3500
+    row(f"RPM máximo observado: {r['max_observed']:.0f}   "
+        f"{_flag(warn_cov, '⚠ Zonas altas sin cubrir', '✓')}")
+    if warn_cov:
+        note("Correcciones VE solo válidas para rango urbano/ralentí")
+        note("Hacer rodada con aceleraciones para cubrir zonas de alta carga")
+
+    # ── BAROMETRO ──
+    sec('BARÓMETRO  (motor en marcha)')
+    b = health['baro']
+    if b['avg']:
+        row(f"Prom: {b['avg']:.1f}kPa    Min: {b['min']:.1f}kPa    "
+            f"Max: {b['max']:.1f}kPa    Rango sesión: {b['range']:.1f}kPa")
+
+    lines.append('')
+    return '\n'.join(lines)
+
+
+def print_health_report(health: dict, log_files: list):
+    """Imprime el reporte de salud en consola."""
+    ts = datetime.now().strftime('%Y-%m-%d %H:%M')
+    print(_fmt_health_report(health, log_files, ts))
+
+
+def save_health_report(health: dict, log_files: list, out_path: str):
+    """Guarda el reporte de salud como archivo .md."""
+    ts = datetime.now().strftime('%Y-%m-%d %H:%M')
+    text = _fmt_health_report(health, log_files, ts)
+    # Convertir a Markdown básico: reemplazar líneas de '═' y '─' con headers
+    md_lines = []
+    raw_lines = text.split('\n')
+    for line in raw_lines:
+        stripped = line.strip()
+        if stripped.startswith('═'):
+            continue  # separador, se omite en MD
+        elif stripped.startswith('── '):
+            title = stripped.lstrip('─ ').rstrip('─ ')
+            md_lines.append(f'\n### {title}')
+        elif stripped.startswith('DIAGNÓSTICO'):
+            md_lines.append(f'# {stripped}')
+        else:
+            md_lines.append(line)
+    with open(out_path, 'w', encoding='utf-8') as f:
+        f.write('\n'.join(md_lines))
+    print(f"  Reporte guardado: {out_path}")
+
+
+# ─────────────────────────────────────────────
+# 6. SELECCIÓN INTERACTIVA (renumerado)
 # ─────────────────────────────────────────────
 
 def select_logs_interactive(log_dir: str) -> list:
@@ -583,7 +1171,7 @@ def select_logs_interactive(log_dir: str) -> list:
 
 
 # ─────────────────────────────────────────────
-# 7. MAIN
+# 8. MAIN
 # ─────────────────────────────────────────────
 
 def main():
@@ -603,6 +1191,12 @@ def main():
                         help='Nombre del .table de salida (default: auto)')
     parser.add_argument('--log-dir', default='DataLogs',
                         help='Directorio de logs (default: DataLogs)')
+    parser.add_argument('--save-report', action='store_true',
+                        help='Guardar reporte de salud como archivo .md')
+    parser.add_argument('--no-health', action='store_true',
+                        help='Omitir el reporte de diagnóstico de salud')
+    parser.add_argument('--health-only', action='store_true',
+                        help='Solo mostrar diagnóstico de salud, sin análisis VE')
     args = parser.parse_args()
 
     project_dir = os.path.dirname(os.path.abspath(__file__))
@@ -627,6 +1221,24 @@ def main():
         print("No se seleccionaron logs.")
         sys.exit(1)
 
+    # ── Parsear logs ──
+    print(f"\nParsando {len(log_files)} log(s)...")
+
+    # Cargar versión completa para diagnóstico de salud
+    rows_full = load_msl_full(log_files)
+
+    # ── Diagnóstico de salud ──
+    if not args.no_health:
+        health = analyze_health(rows_full)
+        print_health_report(health, log_files)
+        if args.save_report:
+            ts  = datetime.now().strftime('%Y-%m-%d_%H.%M')
+            md_out = os.path.join(project_dir, f'diagnostico_{ts}.md')
+            save_health_report(health, log_files, md_out)
+
+    if args.health_only:
+        return
+
     if not os.path.exists(msq_path):
         print(f"Error: no se encontró {args.msq}")
         sys.exit(1)
@@ -639,23 +1251,17 @@ def main():
     # ── Cargar historial desde .table files ──
     history = load_history_from_tables(project_dir, table_num)
 
-    # ── Parsear logs ──
-    print(f"\nParsando {len(log_files)} log(s)...")
+    # Cargar versión filtrada (motor caliente, AFR válido) para análisis VE
     rows = load_msl_logs(log_files)
     if not rows:
-        print("No se encontraron muestras válidas.")
+        print("No se encontraron muestras válidas para análisis VE.")
         sys.exit(1)
 
-    # ── Análisis ──
+    # ── Análisis VE ──
     result = analyze(rows, ve_data, ae_cfg, min_samples=args.min_samples, history=history)
 
-    # ── Reporte ──
+    # ── Reporte VE ──
     print_report(result, ae_cfg, log_files, ve_data)
-
-    # ── Efectividad de correcciones previas ──
-    if history:
-        sessions = check_effectiveness(result, history)
-        print_effectiveness(sessions)
 
     # ── Generar .table corregido ──
     if result['lean'] or result['rich']:
