@@ -121,6 +121,7 @@ def load_msl_logs(log_files: list) -> list:
                     'afr':      float(parts[cols['AFR']]),
                     'tps':      float(parts[cols['TPS']]),
                     'clt':      float(parts[cols['CLT']]),
+                    'mat':      float(parts[cols['MAT']])       if 'MAT'       in cols else None,
                     'tpsdot':   float(parts[cols['TPSdot']])   if 'TPSdot'    in cols else 0.0,
                     'accel_pw': float(parts[cols['Accel PW']]) if 'Accel PW'  in cols else 0.0,
                     'ego_cor':  float(parts[cols['EGO cor1']]) if 'EGO cor1'  in cols else 100.0,
@@ -130,6 +131,13 @@ def load_msl_logs(log_files: list) -> list:
 
             # Filtros: motor encendido, AFR válido, motor caliente
             if row['rpm'] < 400 or not (8.0 < row['afr'] < 20.0) or row['clt'] < 70:
+                continue
+            # Excluir decel (TPS cerrado = vacuum sin carga real)
+            if row['tps'] < 3.0:
+                continue
+            # Filtro MAT: solo rango térmico estabilizado (evita oscilación por densidad)
+            mat = row.get('mat')
+            if mat is not None and not (38.0 <= mat <= 58.0):
                 continue
             all_rows.append(row)
 
@@ -533,35 +541,62 @@ def smooth_table(project_dir: str, table_num: int) -> None:
     ve = [[latest['values'][mi * n_cols + ri] for ri in range(n_cols)]
           for mi in range(n_rows)]
 
-    # ── Suavizado con mezcla ponderada por confianza ──
-    # Se aplican múltiples pasadas para propagar el suavizado gradualmente.
-    PASSES = 5
+    # ── Suavizado con mezcla ponderada por confianza + detección de outliers ──
+    # Una celda es outlier si su valor difiere del promedio de vecinos en más de
+    # OUTLIER_THRESHOLD puntos. Los outliers se suavizan agresivamente
+    # independientemente de su frecuencia de corrección.
+    PASSES            = 5
+    OUTLIER_THRESHOLD = 8   # puntos VE de diferencia vs vecinos (radio amplio)
+
+    def neighbor_avg_weighted(mi, ri, grid, radius=1):
+        """Promedio ponderado por distancia inversa en radio NxN."""
+        total_w, total_v = 0.0, 0.0
+        for dmi in range(-radius, radius + 1):
+            for dri in range(-radius, radius + 1):
+                if dmi == 0 and dri == 0:
+                    continue
+                nmi, nri = mi + dmi, ri + dri
+                if 0 <= nmi < n_rows and 0 <= nri < n_cols:
+                    dist = (dmi ** 2 + dri ** 2) ** 0.5
+                    w = 1.0 / dist
+                    total_w += w
+                    total_v += grid[nmi][nri] * w
+        return (total_v / total_w) if total_w > 0 else None
+
+    # Detectar outliers con radio amplio (5x5) para capturar clusters elevados
+    # que se protegerían mutuamente en radio 3x3
+    outliers = set()
+    for mi in range(n_rows):
+        for ri in range(n_cols):
+            navg = neighbor_avg_weighted(mi, ri, ve, radius=2)
+            if navg is not None and abs(ve[mi][ri] - navg) > OUTLIER_THRESHOLD:
+                outliers.add((mi, ri))
+
+    if outliers:
+        print(f"\n  Celdas outlier detectadas (>{OUTLIER_THRESHOLD} pts vs vecinos): {len(outliers)}")
+        for mi, ri in sorted(outliers):
+            navg = neighbor_avg_weighted(mi, ri, ve, radius=2)
+            print(f"    MAP={latest['map_bins'][mi]:.0f} kPa  RPM={latest['rpm_bins'][ri]}"
+                  f"  VE={ve[mi][ri]:.1f}  vecinos_avg={navg:.1f}")
+
     for _pass in range(PASSES):
         ve_next = [row[:] for row in ve]
 
         for mi in range(n_rows):
             for ri in range(n_cols):
+                is_outlier = (mi, ri) in outliers
                 alpha = max(0.0, 1.0 - freq[mi][ri] / anchor_threshold)
+
+                # Outlier: forzar alpha alto para que converja hacia vecinos
+                if is_outlier:
+                    alpha = max(alpha, 0.7)
+
                 if alpha == 0.0:
-                    continue  # anclada
+                    continue  # anclada y no es outlier
 
-                # Promedio ponderado por distancia inversa de vecinos 3x3
-                total_w = 0.0
-                total_v = 0.0
-                for dmi in (-1, 0, 1):
-                    for dri in (-1, 0, 1):
-                        if dmi == 0 and dri == 0:
-                            continue
-                        nmi, nri = mi + dmi, ri + dri
-                        if 0 <= nmi < n_rows and 0 <= nri < n_cols:
-                            dist = (dmi ** 2 + dri ** 2) ** 0.5
-                            w = 1.0 / dist
-                            total_w += w
-                            total_v += ve[nmi][nri] * w
-
-                if total_w > 0:
-                    neighbor_avg = total_v / total_w
-                    blended = ve[mi][ri] * (1.0 - alpha) + neighbor_avg * alpha
+                navg = neighbor_avg_weighted(mi, ri, ve)
+                if navg is not None:
+                    blended = ve[mi][ri] * (1.0 - alpha) + navg * alpha
                     ve_next[mi][ri] = round(blended, 1)
 
         ve = ve_next
@@ -1335,8 +1370,8 @@ def main():
                         help='Archivo MSQ (default: CurrentTune.msq)')
     parser.add_argument('--table-num', type=int, default=1, choices=[1, 2, 3],
                         help='Número de tabla VE a usar del MSQ (default: 1)')
-    parser.add_argument('--min-samples', type=int, default=5,
-                        help='Mínimo de muestras por celda (default: 5)')
+    parser.add_argument('--min-samples', type=int, default=20,
+                        help='Mínimo de muestras por celda (default: 20)')
     parser.add_argument('--out', metavar='FILE',
                         help='Nombre del .table de salida (default: auto)')
     parser.add_argument('--log-dir', default='DataLogs',
