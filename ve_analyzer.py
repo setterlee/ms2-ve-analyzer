@@ -26,12 +26,16 @@ from pathlib import Path
 # 1. LECTURA DE ARCHIVOS
 # ─────────────────────────────────────────────
 
-def load_ve_table(msq_path: str, table_num: int = 1) -> dict:
+def load_ve_table(msq_path: str, table_num: int = 1, project_dir: str = None) -> dict:
     """
     Carga la tabla VE completa desde CurrentTune.msq:
       - Bins RPM : frpm_table{N}
       - Bins MAP : fmap_table{N}
       - Valores  : veTable{N}
+
+    La base VE siempre es el MSQ (lo que el usuario importó manualmente en
+    TunerStudio). Esto garantiza idempotencia: correr el script N veces con
+    los mismos logs produce siempre el mismo resultado.
     """
     with open(msq_path, errors='replace') as f:
         msq = f.read()
@@ -42,8 +46,8 @@ def load_ve_table(msq_path: str, table_num: int = 1) -> dict:
             raise ValueError(f"No se encontró '{name}' en {msq_path}")
         return [float(x) for x in re.findall(r'[\d.]+', m.group(1))]
 
-    rpm_bins = [int(v) for v in get_constant(f'frpm_table{table_num}')]
-    map_bins = get_constant(f'fmap_table{table_num}')
+    rpm_bins  = [int(v) for v in get_constant(f'frpm_table{table_num}')]
+    map_bins  = get_constant(f'fmap_table{table_num}')
     ve_values = get_constant(f'veTable{table_num}')
 
     n_rows, n_cols = len(map_bins), len(rpm_bins)
@@ -52,7 +56,7 @@ def load_ve_table(msq_path: str, table_num: int = 1) -> dict:
                          f"esperaba {n_rows * n_cols}")
 
     ve = [ve_values[r * n_cols:(r + 1) * n_cols] for r in range(n_rows)]
-    print(f"  Fuente: {os.path.basename(msq_path)}  (tabla {table_num})")
+    print(f"  Base VE : {os.path.basename(msq_path)}  (tabla {table_num})")
     return {'rpm_bins': rpm_bins, 'map_bins': map_bins, 've': ve,
             'n_rows': n_rows, 'n_cols': n_cols,
             've_source': msq_path, 'bins_source': msq_path}
@@ -1408,13 +1412,15 @@ def main():
     args = parser.parse_args()
 
     project_dir = os.path.dirname(os.path.abspath(__file__))
+    table_dir   = os.path.join(project_dir, 've-calibration-process')
+    os.makedirs(table_dir, exist_ok=True)
     log_dir     = os.path.join(project_dir, args.log_dir)
     msq_path    = os.path.join(project_dir, args.msq)
     table_num   = args.table_num
 
     # ── Suavizado de tabla (no requiere logs) ──
     if args.smooth:
-        smooth_table(project_dir, table_num)
+        smooth_table(table_dir, table_num)
         return
 
     # ── Selección de logs ──
@@ -1462,7 +1468,7 @@ def main():
     ae_cfg  = load_ae_config(msq_path)
 
     # ── Cargar historial desde .table files ──
-    history = load_history_from_tables(project_dir, table_num)
+    history = load_history_from_tables(table_dir, table_num)
 
     # Cargar versión filtrada (motor caliente, AFR válido) para análisis VE
     rows = load_msl_logs(log_files, include_idle=args.include_idle)
@@ -1476,14 +1482,39 @@ def main():
     # ── Reporte VE ──
     print_report(result, ae_cfg, log_files, ve_data, include_idle=args.include_idle)
 
-    # ── Generar .table corregido ──
+    # ── Generar .table corregido o detectar convergencia ──
+    n_sessions = len(history)
     if result['lean'] or result['rich']:
         ts  = datetime.now().strftime('%Y-%m-%d_%H.%M')
-        out = args.out or os.path.join(project_dir, f'veTable{table_num}Tbl_{ts}_corrected.table')
+        out = args.out or os.path.join(table_dir, f'veTable{table_num}Tbl_{ts}_corrected.table')
         print("── TABLA CORREGIDA ───────────────────────────────────")
         generate_table(result, ve_data, out)
+        print(f"\n  Sesión {n_sessions + 1} de calibración completada.")
+        print(f"  Importa la tabla corregida, toma nuevos logs y vuelve a correr el análisis.")
     else:
-        print("No hay correcciones que aplicar.")
+        # ── CONVERGENCIA ──
+        skipped = result.get('skipped', [])
+        print("\n" + "="*60)
+        if n_sessions == 0:
+            # Sin historial: base del MSQ ya está bien — caso raro
+            print("  Sin correcciones en primera sesión.")
+            print("  Considera tomar más logs para mayor cobertura.")
+        else:
+            print("  ¡CALIBRACIÓN COMPLETA!")
+            print("="*60)
+            print(f"  Todas las celdas cubiertas están dentro del objetivo")
+            print(f"  después de {n_sessions} sesión(es) de corrección.")
+            if skipped:
+                print(f"  ({len(skipped)} celdas con delta=±1 — ruido dentro de dead band)")
+            print()
+            print("  Generando tabla suavizada final...")
+            smooth_table(table_dir, table_num)
+            print()
+            print("  De ahora en adelante el flujo es:")
+            print("  1. Saca logs en condiciones controladas")
+            print("  2. Corre el script  →  si hay desviaciones aplica correcciones")
+            print("  3. Corre --smooth   →  carga la _smoothed.table en tabla 3")
+        print("="*60)
 
 
 if __name__ == '__main__':
