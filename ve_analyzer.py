@@ -87,8 +87,12 @@ def load_ae_config(msq_path: str) -> dict:
     }
 
 
-def load_msl_logs(log_files: list) -> list:
-    """Parsea uno o más .msl (texto tab-delimitado con header binario)."""
+def load_msl_logs(log_files: list, include_idle: bool = False) -> list:
+    """Parsea uno o más .msl (texto tab-delimitado con header binario).
+
+    include_idle: si True, incluye filas de ralentí estable (TPS<3%, CLT>70°C,
+    RPM 600-1200, sin AE, MAP estable) además de las de carga normal.
+    """
     all_rows = []
     for fname in log_files:
         with open(fname, 'rb') as fh:
@@ -123,6 +127,7 @@ def load_msl_logs(log_files: list) -> list:
                     'clt':      float(parts[cols['CLT']]),
                     'mat':      float(parts[cols['MAT']])       if 'MAT'       in cols else None,
                     'tpsdot':   float(parts[cols['TPSdot']])   if 'TPSdot'    in cols else 0.0,
+                    'mapdot':   float(parts[cols['MAPdot']])   if 'MAPdot'    in cols else 0.0,
                     'accel_pw': float(parts[cols['Accel PW']]) if 'Accel PW'  in cols else 0.0,
                     'ego_cor':  float(parts[cols['EGO cor1']]) if 'EGO cor1'  in cols else 100.0,
                 }
@@ -132,9 +137,20 @@ def load_msl_logs(log_files: list) -> list:
             # Filtros: motor encendido, AFR válido, motor caliente
             if row['rpm'] < 400 or not (8.0 < row['afr'] < 20.0) or row['clt'] < 70:
                 continue
-            # Excluir decel (TPS cerrado = vacuum sin carga real)
+            # Excluir TPS cerrado (decel o ralentí)
+            # Excepción: ralentí estable permitido cuando include_idle=True
             if row['tps'] < 3.0:
-                continue
+                if include_idle:
+                    idle_ok = (
+                        row['clt'] > 70
+                        and 600 < row['rpm'] < 1200
+                        and row.get('accel_pw', 0) <= 0.05
+                        and abs(row.get('mapdot', 0)) < 15
+                    )
+                    if not idle_ok:
+                        continue
+                else:
+                    continue
             # Filtro MAT: solo rango térmico estabilizado (evita oscilación por densidad)
             mat = row.get('mat')
             if mat is not None and not (38.0 <= mat <= 58.0):
@@ -281,7 +297,8 @@ def analyze(rows: list, ve_data: dict, ae_cfg: dict,
 # 3. REPORTE
 # ─────────────────────────────────────────────
 
-def print_report(result: dict, ae_cfg: dict, log_files: list, ve_data: dict):
+def print_report(result: dict, ae_cfg: dict, log_files: list, ve_data: dict,
+                 include_idle: bool = False):
     ae   = result['ae']
     lean = result['lean']
     rich = result['rich']
@@ -292,6 +309,8 @@ def print_report(result: dict, ae_cfg: dict, log_files: list, ve_data: dict):
     print(f"  Fuente VE  : {os.path.basename(ve_data['ve_source'])}")
     print(f"  Logs       : {', '.join(os.path.basename(f) for f in log_files)}")
     print(f"  Muestras   : {ae['total']:,} válidas")
+    if include_idle:
+        print(f"  Modo       : incluye ralentí estable (TPS<3%, CLT>70°C, sin AE)")
     print()
 
     print("── CONFIGURACIÓN AE ──────────────────────────────────")
@@ -1384,6 +1403,8 @@ def main():
                         help='Solo mostrar diagnóstico de salud, sin análisis VE')
     parser.add_argument('--smooth', action='store_true',
                         help='Suavizar tabla VE usando historial de _corrected.table')
+    parser.add_argument('--include-idle', action='store_true',
+                        help='Incluir ralentí estable (TPS<3%%, CLT>70°C) en correcciones VE')
     args = parser.parse_args()
 
     project_dir = os.path.dirname(os.path.abspath(__file__))
@@ -1444,7 +1465,7 @@ def main():
     history = load_history_from_tables(project_dir, table_num)
 
     # Cargar versión filtrada (motor caliente, AFR válido) para análisis VE
-    rows = load_msl_logs(log_files)
+    rows = load_msl_logs(log_files, include_idle=args.include_idle)
     if not rows:
         print("No se encontraron muestras válidas para análisis VE.")
         sys.exit(1)
@@ -1453,7 +1474,7 @@ def main():
     result = analyze(rows, ve_data, ae_cfg, min_samples=args.min_samples, history=history)
 
     # ── Reporte VE ──
-    print_report(result, ae_cfg, log_files, ve_data)
+    print_report(result, ae_cfg, log_files, ve_data, include_idle=args.include_idle)
 
     # ── Generar .table corregido ──
     if result['lean'] or result['rich']:
