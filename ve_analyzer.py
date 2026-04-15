@@ -785,6 +785,7 @@ def load_msl_full(log_files: list) -> list:
         'TPSdot':                     'tpsdot',
         'MAPdot':                     'mapdot',
         'Accel PW':                   'accel_pw',
+        'fuel_pressure':              'fuel_pressure',
     }
     all_rows = []
     for fname in log_files:
@@ -1076,6 +1077,88 @@ def analyze_health(rows: list) -> dict:
         'range': (max(baro) - min(baro)) if len(baro) > 1 else 0,
     }
 
+    # ── REGULADOR DE PRESIÓN 1:1 ──
+    # Con sensor de presión disponible, calculamos ΔP directamente:
+    #   ΔP = P_rail_absoluta − P_manifold
+    #      = (FP_gauge_PSI × 6.895 + Baro) − MAP   [todo en kPa]
+    # Con regulador 1:1 funcionando, ΔP debe ser constante independiente de MAP.
+    # Diagnóstico por tendencia ΔP vs MAP:
+    #   slope ≈ 0         → regulador OK
+    #   slope > 0 (ΔP sube a MAP bajo) → vacío desconectado: sin referencia, ΔP
+    #                                     sube en ralentí → inyecta de más
+    #   slope < 0 (ΔP baja a MAP bajo) → diafragma roto: combustible en línea de vacío
+    # Sin sensor: inferencia indirecta por desviación AFR vs MAP.
+    PSI_TO_KPA = 6.895
+
+    fp_rows = [r for r in warm_run
+               if (r.get('ae_pct') or 100) < 106
+               and (r.get('tps')    or 0)   > 0.5
+               and abs(r.get('mapdot') or 0) < 15]
+
+    has_fp_sensor = any(r.get('fuel_pressure') is not None for r in fp_rows)
+
+    MAP_BUCKETS = [(20, 35), (35, 50), (50, 65), (65, 80), (80, 95)]
+    fp_buckets  = []
+
+    if has_fp_sensor:
+        for lo, hi in MAP_BUCKETS:
+            mid  = (lo + hi) / 2
+            bucket = [r for r in fp_rows
+                      if lo <= (r.get('map') or 0) < hi
+                      and r.get('fuel_pressure') is not None
+                      and 10 < r['fuel_pressure'] < 120]   # rango válido PSI
+            if len(bucket) < 20:
+                continue
+            delta_p = [r['fuel_pressure'] * PSI_TO_KPA
+                       + (r.get('baro') or 94.0)
+                       - r['map']
+                       for r in bucket]
+            fp_buckets.append({
+                'lo': lo, 'hi': hi, 'mid': mid,
+                'n':       len(bucket),
+                'fp_avg':  _mean([r['fuel_pressure'] for r in bucket]),
+                'dp_avg':  _mean(delta_p),
+                'dp_std':  _stdev(delta_p),
+                'dp_min':  min(delta_p),
+                'dp_max':  max(delta_p),
+            })
+    else:
+        # Sin sensor: comparar desviación AFR vs MAP como proxy
+        for lo, hi in MAP_BUCKETS:
+            mid  = (lo + hi) / 2
+            afrs = [r['afr'] for r in fp_rows
+                    if r.get('afr') and 8 < r['afr'] < 20
+                    and lo <= (r.get('map') or 0) < hi]
+            if len(afrs) >= 20:
+                avg = _mean(afrs)
+                tgt = target_afr(mid)
+                fp_buckets.append({
+                    'lo': lo, 'hi': hi, 'mid': mid,
+                    'n': len(afrs), 'afr_avg': avg,
+                    'target': tgt, 'deviation': avg - tgt,
+                })
+
+    # Regresión lineal: métrica principal vs MAP
+    fp_slope = None
+    if len(fp_buckets) >= 3:
+        maps = [b['mid'] for b in fp_buckets]
+        if has_fp_sensor:
+            vals = [b['dp_avg'] for b in fp_buckets]
+        else:
+            vals = [b['deviation'] for b in fp_buckets]
+        mx  = _mean(maps);  mv = _mean(vals)
+        num = sum((maps[i] - mx) * (vals[i] - mv) for i in range(len(maps)))
+        den = sum((maps[i] - mx) ** 2              for i in range(len(maps)))
+        fp_slope = num / den if den > 0 else 0.0
+
+    health['fuel_pressure'] = {
+        'n_total':        len(fp_rows),
+        'buckets':        fp_buckets,
+        'slope':          fp_slope,
+        'n_buckets':      len(fp_buckets),
+        'has_fp_sensor':  has_fp_sensor,
+    }
+
     health['n_total'] = n_total
     return health
 
@@ -1306,6 +1389,86 @@ def _fmt_health_report(health: dict, log_files: list, timestamp: str) -> str:
     if b['avg']:
         row(f"Prom: {b['avg']:.1f}kPa    Min: {b['min']:.1f}kPa    "
             f"Max: {b['max']:.1f}kPa    Rango sesión: {b['range']:.1f}kPa")
+
+    # ── REGULADOR DE PRESIÓN 1:1 ──
+    sec('REGULADOR PRESIÓN 1:1  (vacío-referenciado)')
+    fp = health.get('fuel_pressure', {})
+    has_sensor = fp.get('has_fp_sensor', False)
+
+    if fp.get('n_buckets', 0) < 2:
+        row(f"Datos insuficientes por zona MAP — muestras: {fp.get('n_total', 0)}")
+        note("Necesita logs con variedad de carga (MAP 20–95 kPa)")
+    elif has_sensor:
+        # ── Con sensor de presión: mostrar ΔP por zona MAP ──
+        row(f"Sensor: fuel_pressure (PSI)   Muestras: {fp['n_total']:,}")
+        row(f"Principio: ΔP = FP_gauge×6.895 + Baro − MAP  →  debe ser constante")
+        row(f"  {'Zona MAP':>12}  {'n':>5}  {'FP (PSI)':>9}  {'ΔP (kPa)':>9}  "
+            f"{'std':>6}  {'min–max':>14}")
+        row(f"  " + "─" * 62)
+        for b in fp['buckets']:
+            dp_range = f"{b['dp_min']:.0f}–{b['dp_max']:.0f}"
+            flag = '  ⚠' if b['dp_std'] > 8 else ''
+            row(f"  {b['lo']:.0f}–{b['hi']:.0f} kPa:   "
+                f"{b['n']:>5}  "
+                f"{b['fp_avg']:>9.1f}  "
+                f"{b['dp_avg']:>9.1f}  "
+                f"{b['dp_std']:>6.1f}  "
+                f"{dp_range:>14}{flag}")
+
+        slope   = fp.get('slope')
+        dp_avgs = [b['dp_avg'] for b in fp['buckets']]
+        dp_stds = [b['dp_std'] for b in fp['buckets']]
+        overall_std = _stdev(dp_avgs)   # variación del ΔP promedio entre zonas
+
+        if slope is not None and abs(slope) > 0.3:    # >0.3 kPa/kPa MAP = ~2% variación
+            if slope > 0:
+                row(f"\n  ΔP sube a MAP bajo (slope={slope:+.2f} kPa/kPa)   ⚠ REVISAR")
+                note("Vacío del regulador desconectado o con fuga:")
+                note("sin referencia de vacío, la presión no baja en ralentí")
+                note("→ ΔP más alto de lo normal a baja carga → inyecta de más")
+                note("Revisar manguera regulador ↔ intake manifold")
+            else:
+                row(f"\n  ΔP baja a MAP bajo (slope={slope:+.2f} kPa/kPa)   ⚠ REVISAR")
+                note("Posible diafragma roto — combustible entrando a línea de vacío")
+                note("O caída de presión de bomba a baja demanda (obstrucción retorno)")
+        elif overall_std > 5:
+            row(f"\n  ΔP variable entre zonas (std={overall_std:.1f} kPa)   ⚠ REVISAR")
+            note("Alta dispersión — posible regulador con histéresis o sello parcial")
+        else:
+            row(f"\n  ΔP estable entre zonas (std={overall_std:.1f} kPa)   ✓")
+            note("Regulador 1:1 funcionando correctamente")
+    else:
+        # ── Sin sensor: inferencia indirecta por AFR vs MAP ──
+        row(f"Sin sensor fuel_pressure — inferencia por desviación AFR vs MAP")
+        row(f"  {'Zona MAP':>12}  {'n':>5}  {'AFR':>7}  {'Target':>7}  {'Desv':>7}")
+        row(f"  " + "─" * 46)
+        for b in fp['buckets']:
+            sign = '+' if b['deviation'] >= 0 else ''
+            flag = '  ⚠' if abs(b['deviation']) > 0.8 else ''
+            row(f"  {b['lo']:.0f}–{b['hi']:.0f} kPa:   "
+                f"{b['n']:>5}  "
+                f"{b['afr_avg']:>7.2f}  "
+                f"{b['target']:>7.1f}  "
+                f"{sign}{b['deviation']:>6.2f}{flag}")
+
+        slope = fp.get('slope')
+        devs  = [b['deviation'] for b in fp['buckets']]
+        if slope is not None and abs(slope) > 0.025:
+            if slope > 0:
+                row(f"\n  Tendencia AFR: RICO en MAP bajo → normal en MAP alto   ⚠ REVISAR")
+                note("Patrón compatible con línea de vacío desconectada")
+            else:
+                row(f"\n  Tendencia AFR: POBRE en MAP bajo → normal en MAP alto   ⚠ REVISAR")
+                note("Posible diafragma roto o caída de presión a baja carga")
+        elif all(d < -0.5 for d in devs):
+            row(f"\n  Sesgo uniforme RICO en todas las zonas MAP   ⚠ REVISAR")
+            note("Presión base alta, o VE sobredimensionada globalmente")
+        elif all(d > 0.5 for d in devs):
+            row(f"\n  Sesgo uniforme POBRE en todas las zonas MAP   ⚠ REVISAR")
+            note("Presión base baja, bomba débil, o VE subestimada globalmente")
+        else:
+            row(f"\n  Sin tendencia sistemática por MAP   ✓")
+            note("Comportamiento consistente con regulador 1:1 funcionando")
 
     lines.append('')
     return '\n'.join(lines)
