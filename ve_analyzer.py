@@ -624,6 +624,42 @@ def smooth_table(project_dir: str, table_num: int) -> None:
 
         ve = ve_next
 
+    # ── Post-suavizado: restricción de gradiente cardinal ─────────────────
+    # Celdas ancladas con alta frecuencia pueden crear picos físicamente
+    # irreales que el suavizado no toca. Este paso los corrige igualmente:
+    # si cualquier par de celdas adyacentes (↑↓←→) difiere más de
+    # MAX_GRADIENT, la celda más alta se baja hasta (vecino + MAX_GRADIENT).
+    # Se itera hasta convergencia (máx 20 vueltas).
+    MAX_GRADIENT = 8.0   # puntos VE máximos permitidos entre celdas adyacentes
+
+    grad_corrections: dict = {}   # (mi, ri) → (valor_original, valor_final)
+    for _iter in range(20):
+        any_change = False
+        for mi in range(n_rows):
+            for ri in range(n_cols):
+                for nmi, nri in [(mi - 1, ri), (mi + 1, ri),
+                                 (mi, ri - 1), (mi, ri + 1)]:
+                    if not (0 <= nmi < n_rows and 0 <= nri < n_cols):
+                        continue
+                    diff = ve[mi][ri] - ve[nmi][nri]
+                    if diff > MAX_GRADIENT:
+                        if (mi, ri) not in grad_corrections:
+                            grad_corrections[(mi, ri)] = (ve[mi][ri], None)
+                        ve[mi][ri] = round(ve[nmi][nri] + MAX_GRADIENT, 1)
+                        grad_corrections[(mi, ri)] = (
+                            grad_corrections[(mi, ri)][0], ve[mi][ri])
+                        any_change = True
+        if not any_change:
+            break
+
+    if grad_corrections:
+        print(f"\n  Restricción de gradiente (máx={MAX_GRADIENT:.0f} pts entre adyacentes):")
+        for (mi, ri), (v_old, v_new) in sorted(grad_corrections.items()):
+            print(f"    MAP={latest['map_bins'][mi]:.0f} kPa  "
+                  f"RPM={latest['rpm_bins'][ri]}  "
+                  f"{v_old:.1f} → {v_new:.1f}  "
+                  f"[freq={freq[mi][ri]}]")
+
     # ── Calcular delta total aplicado ──
     orig = [[latest['values'][mi * n_cols + ri] for ri in range(n_cols)]
             for mi in range(n_rows)]
