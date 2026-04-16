@@ -132,6 +132,7 @@ def load_msl_logs(log_files: list, include_idle: bool = False) -> list:
                     'mat':      float(parts[cols['MAT']])       if 'MAT'       in cols else None,
                     'tpsdot':   float(parts[cols['TPSdot']])   if 'TPSdot'    in cols else 0.0,
                     'mapdot':   float(parts[cols['MAPdot']])   if 'MAPdot'    in cols else 0.0,
+                    'rpmdot':   float(parts[cols['RPMdot']])   if 'RPMdot'    in cols else 0.0,
                     'accel_pw': float(parts[cols['Accel PW']]) if 'Accel PW'  in cols else 0.0,
                     'ego_cor':  float(parts[cols['EGO cor1']]) if 'EGO cor1'  in cols else 100.0,
                 }
@@ -154,6 +155,16 @@ def load_msl_logs(log_files: list, include_idle: bool = False) -> list:
                     if not idle_ok:
                         continue
                 else:
+                    continue
+            else:
+                # Carga normal: excluir transitorios de AE y desaceleración fuerte.
+                # AE activo (accel_pw > 0.05): el ECU añade combustible extra encima
+                # del VE — el AFR no refleja el VE de la celda sino el transitorio.
+                # RPMdot < -400: motor pasando por la celda en desaceleración;
+                # el llenado del colector no está en estado estacionario.
+                if row.get('accel_pw', 0) > 0.05:
+                    continue
+                if abs(row.get('rpmdot', 0)) > 400:
                     continue
             # Filtro MAT: solo rango térmico estabilizado (evita oscilación por densidad)
             mat = row.get('mat')
@@ -326,11 +337,13 @@ def print_report(result: dict, ae_cfg: dict, log_files: list, ve_data: dict,
     print()
 
     print("── RESUMEN AE ────────────────────────────────────────")
+    afr_on_str  = f"{ae['afr_on_avg']:.2f}"  if ae['afr_on_avg']  is not None else "N/A"
+    afr_off_str = f"{ae['afr_off_avg']:.2f}" if ae['afr_off_avg'] is not None else "N/A"
     print(f"  Con AE activo   : {ae['ae_on_pct']:.1f}%  "
-          f"(AFR avg {ae['afr_on_avg']:.2f}  — "
+          f"(AFR avg {afr_on_str}  — "
           f"pobres {ae['lean_on_pct']:.0f}%  ricos {ae['rich_on_pct']:.0f}%)")
     print(f"  Sin AE          : {ae['ae_off_pct']:.1f}%  "
-          f"(AFR avg {ae['afr_off_avg']:.2f}  — "
+          f"(AFR avg {afr_off_str}  — "
           f"pobres {ae['lean_off_pct']:.0f}%)")
     print(f"  Tapering (tpsdot<thresh con AE>0): {ae['taper_pct']:.0f}% del AE total")
     print()
