@@ -88,6 +88,8 @@ def load_ae_config(msq_path: str) -> dict:
         'tpsThresh':   get_scalar('tpsThresh'),
         'aeTaperTime': get_scalar('aeTaperTime'),
         'aeEndPW':     get_scalar('aeEndPW'),
+        'taeColdA':    get_scalar('taeColdA'),
+        'taeColdM':    get_scalar('taeColdM'),
     }
 
 
@@ -170,6 +172,7 @@ def load_msl_logs(log_files: list, include_idle: bool = False) -> list:
             mat = row.get('mat')
             if mat is not None and not (38.0 <= mat <= 58.0):
                 continue
+            row['file_idx'] = fi
             all_rows.append(row)
 
     return all_rows
@@ -833,11 +836,14 @@ def load_msl_full(log_files: list) -> list:
         'Barometer':                  'baro',
         'TPSdot':                     'tpsdot',
         'MAPdot':                     'mapdot',
+        'RPMdot':                     'rpmdot',
         'Accel PW':                   'accel_pw',
+        'PW':                         'pw',
+        'SecL':                       'secl',
         'fuel_pressure':              'fuel_pressure',
     }
     all_rows = []
-    for fname in log_files:
+    for fi, fname in enumerate(log_files):
         with open(fname, 'rb') as fh:
             raw = fh.read()
         text_start = raw.find(b'Time')
@@ -1553,6 +1559,424 @@ def save_health_report(health: dict, log_files: list, out_path: str):
 
 
 # ─────────────────────────────────────────────
+# 7. CALIBRACIÓN AE (TAE – Throttle Accel Enrichment)
+# ─────────────────────────────────────────────
+
+AE_TARGET_AFR  = 13.5   # AFR objetivo durante aceleración — balance respuesta/potencia
+AE_SENSOR_LAG  = 6      # samples de lag AEM X-Series (~300 ms @ 20 Hz)
+AE_CLT_MIN     = 70.0
+AE_RPM_MIN     = 700.0
+AE_MIN_SAMPLES = 2      # muestras mínimas con AE activo para contar el evento
+
+
+def detect_ae_events(rows: list, ae_cfg: dict,
+                     sensor_lag: int = AE_SENSOR_LAG) -> list:
+    """
+    Detecta eventos AE individuales en la secuencia de filas de load_msl_full.
+
+    Para cada evento retorna:
+      tpsdot_max   — pico de TPSdot durante el evento (%/s)
+      rpm/map/clt  — condiciones en el onset
+      afr_baseline — AFR promedio antes del onset (sin AE activo)
+      afr_ae_lag   — mínimo AFR en ventana lag-ajustada (pico de enriquecimiento real)
+      afr_delta    — afr_ae_lag − afr_baseline (negativo = se enriqueció, correcto)
+      accel_pw_avg — PW de AE promedio durante el evento (ms)
+      base_pw_avg  — PW base (total − AE) promedio durante el evento (ms)
+      n_samples    — muestras con AE activo
+      bin_idx      — índice del bin taeRates más cercano al tpsdot_max
+    """
+    tae_rates = ae_cfg.get('taeRates') or [11, 300, 629, 884]
+    tae_time  = ae_cfg.get('taeTime')  or 0.4
+    # Ventana de búsqueda post-lag: taeTime + margen de 5 muestras
+    tae_samp  = int(tae_time * 20) + 5
+    PRE_BUF   = 6
+
+    events  = []
+    in_ae   = False
+    ae_st   = 0
+    pre_buf = []
+
+    def process_event(st, en, pb):
+        n_ae = en - st
+        if n_ae < AE_MIN_SAMPLES:
+            return
+
+        # Baseline: AFR en el mismo archivo de log, antes del onset
+        ae_file  = rows[st].get('file_idx', 0)
+        pre_afrs = [rows[j]['afr'] for j in pb
+                    if j < st
+                    and rows[j].get('file_idx', 0) == ae_file
+                    and rows[j].get('afr') and 10 < rows[j]['afr'] < 20]
+        if len(pre_afrs) < 2:
+            return
+        afr_baseline = _mean(pre_afrs)
+
+        # Mínimo AFR en ventana lag-ajustada = pico de enriquecimiento real
+        lag_s    = st + sensor_lag
+        lag_e    = lag_s + n_ae + tae_samp
+        lag_afrs = [rows[j]['afr'] for j in range(lag_s, min(lag_e, len(rows)))
+                    if rows[j].get('afr') and 10 < rows[j]['afr'] < 20]
+        if not lag_afrs:
+            return
+        afr_ae_lag = min(lag_afrs)
+
+        ae_sl     = rows[st:en]
+        tpsdot_mx = max((abs(r.get('tpsdot') or 0) for r in ae_sl), default=0)
+        onset     = rows[st]
+
+        accel_pws = [r.get('accel_pw') or 0.0 for r in ae_sl]
+        pws       = [r.get('pw')       or 0.0 for r in ae_sl]
+        base_vals = [pw - apw for pw, apw in zip(pws, accel_pws) if pw > apw > 0]
+
+        bin_idx = min(range(len(tae_rates)),
+                      key=lambda k: abs(tpsdot_mx - tae_rates[k]))
+
+        events.append({
+            'tpsdot_max':   tpsdot_mx,
+            'rpm':          onset.get('rpm') or 0,
+            'map':          onset.get('map') or 0,
+            'clt':          onset.get('clt') or 0,
+            'afr_baseline': afr_baseline,
+            'afr_ae_lag':   afr_ae_lag,
+            'afr_delta':    afr_ae_lag - afr_baseline,
+            'accel_pw_avg': _mean(accel_pws),
+            'base_pw_avg':  _mean(base_vals) if base_vals else 0.0,
+            'n_samples':    n_ae,
+            'bin_idx':      bin_idx,
+        })
+
+    for i, row in enumerate(rows):
+        ae_active = (row.get('ae_pct') or 100.0) > 105.0
+        if not ae_active:
+            pre_buf = (pre_buf + [i])[-PRE_BUF:]
+        if ae_active and not in_ae:
+            if (row.get('clt') or 0) >= AE_CLT_MIN and (row.get('rpm') or 0) >= AE_RPM_MIN:
+                in_ae = True
+                ae_st = i
+        elif not ae_active and in_ae:
+            in_ae = False
+            process_event(ae_st, i, list(pre_buf))
+
+    # Evento que llega hasta el fin del log
+    if in_ae:
+        process_event(ae_st, len(rows), list(pre_buf))
+
+    return events
+
+
+def analyze_ae_calibration(events: list, ae_cfg: dict) -> dict:
+    """
+    Agrupa eventos por bin taeRates y calcula correcciones de taeBins.
+
+    Fórmula (VE ya calibrado → desviación AFR es 100% responsabilidad del AE):
+      desired_accel_pw = (base_pw + accel_pw) × (afr_ae / target_ae) − base_pw
+      new_taeBin = current_taeBin × (desired_accel_pw / accel_pw)
+    """
+    tae_rates  = ae_cfg.get('taeRates') or [11, 300, 629, 884]
+    tae_bins   = ae_cfg.get('taeBins')  or [0.5, 1.2, 1.8, 2.5]
+    tps_thresh = ae_cfg.get('tpsThresh') or 20.0
+    MIN_EV     = 3
+
+    per_bin = []
+    for b in range(len(tae_rates)):
+        evs = [e for e in events if e['bin_idx'] == b]
+        if not evs:
+            per_bin.append({'rate': tae_rates[b], 'current': tae_bins[b],
+                            'n': 0, 'has_data': False,
+                            'afr_base': None, 'afr_ae': None, 'afr_delta': None,
+                            'accel_pw': None, 'base_pw': None,
+                            'suggested': None, 'status': 'sin datos'})
+            continue
+
+        afr_bases  = [e['afr_baseline'] for e in evs]
+        afr_aes    = [e['afr_ae_lag']   for e in evs]
+        afr_deltas = [e['afr_delta']     for e in evs]
+        a_pws      = [e['accel_pw_avg']  for e in evs if e['accel_pw_avg'] > 0]
+        b_pws      = [e['base_pw_avg']   for e in evs if e['base_pw_avg']  > 0]
+
+        afr_base_avg  = _mean(afr_bases)
+        afr_ae_avg    = _mean(afr_aes)
+        afr_delta_avg = _mean(afr_deltas)
+        accel_pw_avg  = _mean(a_pws) if a_pws else None
+        base_pw_avg   = _mean(b_pws) if b_pws else None
+
+        suggested = None
+        if (len(evs) >= MIN_EV
+                and afr_ae_avg   is not None
+                and accel_pw_avg and accel_pw_avg > 0
+                and base_pw_avg  and base_pw_avg  > 0):
+            desired_apw = ((base_pw_avg + accel_pw_avg) * afr_ae_avg
+                           / AE_TARGET_AFR) - base_pw_avg
+            if desired_apw > 0:
+                scale     = desired_apw / accel_pw_avg
+                suggested = max(0.1, min(round(tae_bins[b] * scale, 1), 10.0))
+
+        diff = (afr_ae_avg - AE_TARGET_AFR) if afr_ae_avg is not None else 0
+        if afr_ae_avg is None:
+            status = 'sin AFR válido'
+        elif len(evs) < MIN_EV:
+            status = f'pocos eventos ({len(evs)}) — no confiable'
+        elif diff >  1.5:
+            status = '⚠ muy pobre — aumentar AE'
+        elif diff < -1.5:
+            status = '⚠ muy rico — reducir AE'
+        elif abs(diff) > 0.5:
+            status = '→ ajuste fino'
+        else:
+            status = '✓ OK'
+
+        per_bin.append({
+            'rate': tae_rates[b], 'current': tae_bins[b], 'n': len(evs),
+            'has_data':  True,
+            'afr_base':  afr_base_avg,
+            'afr_ae':    afr_ae_avg,
+            'afr_delta': afr_delta_avg,
+            'accel_pw':  accel_pw_avg,
+            'base_pw':   base_pw_avg,
+            'suggested': suggested,
+            'status':    status,
+        })
+
+    # Distribución de TPSdot observada — edges ordenados y deduplicados
+    all_tp = [e['tpsdot_max'] for e in events]
+    raw_edges = sorted(set([0.0, tps_thresh] + list(tae_rates)))
+    max_tp = max(all_tp) * 1.1 if all_tp else 1000.0
+    if raw_edges[-1] < max_tp:
+        raw_edges.append(max_tp)
+    brackets = []
+    for j in range(len(raw_edges) - 1):
+        lo, hi = raw_edges[j], raw_edges[j + 1]
+        if hi <= lo:
+            continue
+        cnt = sum(1 for t in all_tp if lo <= t < hi)
+        brackets.append({'lo': lo, 'hi': hi,
+                         'n': cnt, 'pct': _pct(cnt, len(all_tp))})
+
+    # Detectar intervalos con concentración alta pero bins muy separados
+    rate_sugg = []
+    for j in range(len(tae_rates) - 1):
+        lo, hi   = tae_rates[j], tae_rates[j + 1]
+        width    = hi - lo
+        cnt      = sum(1 for t in all_tp if lo <= t < hi)
+        pct      = _pct(cnt, len(all_tp))
+        if width > 150 and pct > 35:
+            mid = round((lo + hi) / 2 / 10) * 10
+            rate_sugg.append({
+                'lo': lo, 'hi': hi, 'pct': pct, 'suggested_mid': mid,
+                'note': (f"{pct:.0f}% de eventos en rango {width:.0f} %/s "
+                         f"({lo:.0f}–{hi:.0f}) sin bin intermedio"),
+            })
+
+    # Colocación óptima de 4 bins basada en la distribución real observada.
+    # Objetivo: cubrir el rango real con resolución pareja.
+    # Usa p10, p40, p70 y max_observed como puntos de anclaje —
+    # no los cuartiles, que colapsarían si la distribución es estrecha.
+    optimal_rates = None
+    if len(all_tp) >= 8:
+        filtered = sorted(t for t in all_tp if t >= tps_thresh)
+        if len(filtered) >= 4:
+            n    = len(filtered)
+            p10  = filtered[max(0, n * 1 // 10)]
+            p40  = filtered[n * 4 // 10]
+            p70  = filtered[n * 7 // 10]
+            pmax = filtered[-1]
+            cand = [
+                max(int(tps_thresh) + 5, round(p10  / 10) * 10),
+                round(p40  / 10) * 10,
+                round(p70  / 10) * 10,
+                round(pmax / 10) * 10,
+            ]
+            # Garantizar separación mínima de 30 %/s entre bins consecutivos
+            for k in range(1, len(cand)):
+                if cand[k] < cand[k - 1] + 30:
+                    cand[k] = cand[k - 1] + 30
+            optimal_rates = cand
+
+    return {
+        'n_total':       len(events),
+        'per_bin':       per_bin,
+        'brackets':      brackets,
+        'rate_sugg':     rate_sugg,
+        'optimal_rates': optimal_rates,
+        'tae_rates':     tae_rates,
+        'tae_bins':      tae_bins,
+        'tps_thresh':    tps_thresh,
+    }
+
+
+def _ae_table_str(added_ms: list, tpsdot: list, label_added: str = 'Added (ms)',
+                  label_tps: str = 'TPSdot (%/s)', notes: list = None) -> str:
+    """
+    Genera string de tabla TAE en formato visual TunerStudio.
+    notes: lista opcional de strings por columna (se imprime debajo).
+    """
+    n  = len(added_ms)
+    # Ancho de cada columna: máximo entre header y valor
+    col_w = []
+    for i in range(n):
+        a_s = f"{added_ms[i]:.1f}" if added_ms[i] is not None else " ?"
+        t_s = f"{tpsdot[i]:.0f}"   if tpsdot[i]   is not None else " ?"
+        col_w.append(max(len(a_s), len(t_s), 5))
+
+    def row_str(values, fmt_fn):
+        cells = ' │ '.join(fmt_fn(v, col_w[i]) for i, v in enumerate(values))
+        return '  │ ' + cells + ' │'
+
+    sep = '  ├─' + '─┼─'.join('─' * w for w in col_w) + '─┤'
+    top = '  ┌─' + '─┬─'.join('─' * w for w in col_w) + '─┐'
+    bot = '  └─' + '─┴─'.join('─' * w for w in col_w) + '─┘'
+
+    def fmt_added(v, w):
+        s = f"{v:.1f}" if v is not None else '?'
+        return s.rjust(w)
+
+    def fmt_tps(v, w):
+        s = f"{v:.0f}" if v is not None else '?'
+        return s.rjust(w)
+
+    lines = [top,
+             row_str(added_ms, fmt_added),
+             sep,
+             row_str(tpsdot,   fmt_tps),
+             bot]
+
+    # Leyenda de filas
+    lbl_w = max(len(label_added), len(label_tps))
+    lines[1] = f"  {label_added:<{lbl_w}} " + lines[1][2:]
+    lines[3] = f"  {label_tps:<{lbl_w}} " + lines[3][2:]
+    lines[0] = ' ' * (lbl_w + 2) + lines[0][2:]
+    lines[2] = ' ' * (lbl_w + 2) + lines[2][2:]
+    lines[4] = ' ' * (lbl_w + 2) + lines[4][2:]
+
+    if notes:
+        note_row = ' ' * (lbl_w + 5)
+        note_row += '   '.join(
+            (n[:col_w[i]]).ljust(col_w[i]) for i, n in enumerate(notes)
+        )
+        lines.append(note_row)
+
+    return '\n'.join(lines)
+
+
+def print_ae_calibration(result: dict, ae_cfg: dict):
+    """Imprime reporte de calibración AE con tablas en formato TunerStudio."""
+    tae_rates  = result['tae_rates']
+    tae_bins   = result['tae_bins']
+    tps_thresh = result['tps_thresh']
+
+    print('\n' + '=' * 60)
+    print('  CALIBRACIÓN AE — TAE (Throttle Acceleration Enrichment)')
+    print('=' * 60)
+    print(f"  tpsThresh  : {ae_cfg.get('tpsThresh')} %/s  "
+          f"(TPSdot mínimo para disparar AE)")
+    print(f"  taeTime    : {ae_cfg.get('taeTime')} s   "
+          f"aeTaperTime: {ae_cfg.get('aeTaperTime')} s")
+    cold_a = ae_cfg.get('taeColdA')
+    cold_m = ae_cfg.get('taeColdM')
+    if cold_a is not None and cold_m is not None:
+        print(f"  taeColdA/M : +{cold_a}ms / ×{cold_m:.0f}%  "
+              f"(solo motor frío — excluido del análisis)")
+    print(f"  AFR target : {AE_TARGET_AFR}   "
+          f"Lag sensor: {AE_SENSOR_LAG} muestras (~{AE_SENSOR_LAG * 50}ms AEM X-Series)")
+    print(f"  Eventos    : {result['n_total']} aceleraciones válidas "
+          f"(CLT≥{AE_CLT_MIN:.0f}°C, RPM≥{AE_RPM_MIN:.0f})")
+    print()
+
+    if result['n_total'] == 0:
+        print("  Sin eventos AE válidos. Incluye logs con aceleraciones "
+              "a temperatura de operación (CLT>70°C).")
+        return
+
+    # ── Tabla ACTUAL (idéntica a TunerStudio) ──
+    print("── TABLA TAE ACTUAL ─────────────────── (como en TunerStudio)")
+    print(_ae_table_str(tae_bins, tae_rates))
+    print()
+
+    # ── Tabla SUGERIDA (solo taeBins, mismos taeRates) ──
+    sug_bins  = []
+    bin_notes = []
+    any_change = False
+    for b in result['per_bin']:
+        if b['suggested'] is not None:
+            sug_bins.append(b['suggested'])
+            diff = b['suggested'] - b['current']
+            bin_notes.append(f"{diff:+.1f}" if abs(diff) >= 0.1 else '=')
+            if abs(diff) >= 0.1:
+                any_change = True
+        else:
+            sug_bins.append(b['current'])
+            ev_tag = f"n={b['n']}" if b['n'] > 0 else 'sin datos'
+            bin_notes.append(ev_tag)
+
+    print("── TABLA TAE SUGERIDA ───────────────── (solo cambiar Added)")
+    print(_ae_table_str(sug_bins, tae_rates, notes=bin_notes))
+    print()
+
+    # ── Diagnóstico por bin ──
+    print("── QUÉ ENCONTRÓ EL ANÁLISIS ────────────────────────────────")
+    for bidx, b in enumerate(result['per_bin']):
+        rate = b['rate']
+        if not b['has_data']:
+            print(f"  Bin {bidx+1} ({rate:.0f} %/s): sin aceleraciones en logs — no hay datos")
+        else:
+            afr_b = f"{b['afr_base']:.2f}" if b['afr_base'] else "?"
+            afr_a = f"{b['afr_ae']:.2f}"   if b['afr_ae']   else "?"
+            n     = b['n']
+            print(f"  Bin {bidx+1} ({rate:.0f} %/s):  {n} eventos  "
+                  f"AFR antes = {afr_b}  →  AFR con AE = {afr_a}  "
+                  f"(obj {AE_TARGET_AFR})   {b['status']}")
+    print()
+
+    # ── Distribución: cuántos eventos cayeron en cada zona ──
+    print("── DÓNDE ESTÁN TUS ACELERACIONES (TPSdot) ──────────────────")
+    max_n = max(bk['n'] for bk in result['brackets']) or 1
+    for bk in result['brackets']:
+        bar   = '█' * round(bk['pct'] / 3) if bk['n'] > 0 else ''
+        lo_s  = f"{bk['lo']:.0f}"
+        hi_s  = f"{bk['hi']:.0f}" if bk['hi'] < 5000 else '→'
+        label = f"{lo_s:>5}–{hi_s:<5} %/s"
+        is_bin = any(abs(bk['hi'] - r) < 3 for r in tae_rates)
+        is_thr = abs(bk['hi'] - tps_thresh) < 3
+        tag   = f"  ← bin {next((str(k+1) for k,r in enumerate(tae_rates) if abs(r-bk['hi'])<3),'')}" if is_bin else ''
+        tag   = '  ← tpsThresh' if is_thr else tag
+        print(f"  {label} : {bk['n']:>4} ev  {bar}{tag}")
+    print()
+
+    # ── Reorganización taeRates si hace falta ──
+    if result['rate_sugg'] and result['optimal_rates']:
+        opt  = result['optimal_rates']
+        # Para los nuevos rates, interpolar taeBins sugeridos desde los actuales
+        # (usamos los sug_bins ya calculados como referencia del bin 0,
+        #  y los bins 1-3 quedan como actuales hasta tener datos)
+        opt_bins = list(sug_bins)   # copia; sug_bins ya tiene correcciones donde hay datos
+        print("── SUGERENCIA: REDISTRIBUIR taeRates ───────────────────────")
+        print("  El 98%+ de tus aceleraciones no pasan del primer bin.")
+        print("  Con los taeRates actuales no tienes resolución real.")
+        print()
+        print("  Opción A — solo corregir Added (sin mover rates):")
+        print("  " + "─" * 48)
+        print(_ae_table_str(sug_bins, tae_rates, notes=bin_notes))
+        print()
+        print("  Opción B — redistribuir taeRates a tu rango real de manejo:")
+        print("  " + "─" * 48)
+        opt_notes = ['?' if v == b['current'] else f"{v-b['current']:+.1f}"
+                     for v, b in zip(opt_bins, result['per_bin'])]
+        print(_ae_table_str(opt_bins, opt,
+                            notes=['ajustar' if i > 0 else
+                                   (f"{opt_bins[0]:+.1f}" if opt_bins[0] != tae_bins[0] else '=')
+                                   for i in range(len(opt))]))
+        print()
+        print("  Con Opción B necesitas tomar logs con aceleraciones más fuertes")
+        print("  para calibrar los bins 2-4 (actualmente sin datos).")
+        print()
+    elif any_change:
+        print("── ACCIÓN RECOMENDADA ──────────────────────────────────────")
+        print("  Importar en TunerStudio:")
+        print("  Fuel → Acceleration Enrichment → TAE curve → fila Added (ms)")
+        print()
+
+
+# ─────────────────────────────────────────────
 # 6. SELECCIÓN INTERACTIVA (renumerado)
 # ─────────────────────────────────────────────
 
@@ -1619,6 +2043,8 @@ def main():
                         help='Solo mostrar diagnóstico de salud, sin análisis VE')
     parser.add_argument('--smooth', action='store_true',
                         help='Suavizar tabla VE usando historial de _corrected.table')
+    parser.add_argument('--ae-cal', action='store_true',
+                        help='Calibrar AE: analiza eventos de aceleración y sugiere nuevos taeBins/taeRates')
     parser.add_argument('--include-idle', action='store_true',
                         help='Incluir ralentí estable (TPS<3%%, CLT>70°C) en correcciones VE')
     args = parser.parse_args()
@@ -1666,6 +2092,16 @@ def main():
             ts  = datetime.now().strftime('%Y-%m-%d_%H.%M')
             md_out = os.path.join(project_dir, f'diagnostico_{ts}.md')
             save_health_report(health, log_files, md_out)
+
+    # ── Calibración AE ──
+    if args.ae_cal:
+        if not os.path.exists(msq_path):
+            print(f"Error: no se encontró {args.msq} — necesario para calibración AE")
+            sys.exit(1)
+        ae_cfg_cal = load_ae_config(msq_path)
+        ae_events  = detect_ae_events(rows_full, ae_cfg_cal)
+        ae_cal_res = analyze_ae_calibration(ae_events, ae_cfg_cal)
+        print_ae_calibration(ae_cal_res, ae_cfg_cal)
 
     if args.health_only:
         return
