@@ -1,0 +1,74 @@
+name: Build & Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  # ── Mac ────────────────────────────────────────────────────────────────────
+  build-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Build macOS
+        run: |
+          pip install pyinstaller
+          pyinstaller \
+            --name "VE-Analyzer" \
+            --windowed \
+            --onedir \
+            --clean \
+            ve_analyzer_gui.py
+          cd dist
+          zip -r "VE-Analyzer-macOS.zip" "VE-Analyzer.app"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mac
+          path: dist/VE-Analyzer-macOS.zip
+
+  # ── Windows ────────────────────────────────────────────────────────────────
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Build Windows
+        run: |
+          pip install pyinstaller
+          pyinstaller --name "VE-Analyzer" --windowed --onefile --clean ve_analyzer_gui.py
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: dist/VE-Analyzer.exe
+
+  # ── Release ────────────────────────────────────────────────────────────────
+  release:
+    needs: [build-macos, build-windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Publicar Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/mac/VE-Analyzer-macOS.zip
+            artifacts/windows/VE-Analyzer.exe
+          generate_release_notes: true

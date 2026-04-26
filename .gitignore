@@ -1,3 +1,27 @@
-.venv-build
-build
-__pycache__
+# ── Datos personales del tune (no publicar) ────────────────────────────────
+*.msq
+restorePoints/
+DataLogs/
+Tables/
+ve-calibration-process/
+REVISIONES_PENDIENTES.md
+std_ms2geno2.log
+
+# ── TunerStudio (archivos de proyecto) ─────────────────────────────────────
+dashboard/
+projectCfg/
+TuneView/
+inc/
+
+# ── Build artifacts ─────────────────────────────────────────────────────────
+build/
+dist/
+*.spec
+.venv-build/
+__pycache__/
+*.pyc
+*.pyo
+
+# ── Sistema ─────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
