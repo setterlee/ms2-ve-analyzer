@@ -17,9 +17,153 @@ import argparse
 import glob
 import os
 import re
+import struct
 import sys
 from datetime import datetime
 from pathlib import Path
+
+
+# ─────────────────────────────────────────────
+# 0. SOPORTE MLG (binario TunerStudio/MegaLogViewer)
+# ─────────────────────────────────────────────
+#
+# Formato MLVLG verificado empíricamente con archivos reales:
+#   Header  24 bytes: magic(5) + flags(3) + timestamp(4) + misc(8) + n_ch(2) + ?(2)
+#   Canales N × 89 bytes: type(1) + name(34) + units(34) + scale(4) + offset(4) + extra(12)
+#   Datos   después de </msq>\r\n: [5 bytes prefijo][datos en orden de canales]
+#
+# Tipos:  0=uint8 (×1)   2=uint16 (×1)   3=uint16 (×0.1)   7=float32 BE
+# Temps:  CLT y MAT se almacenan en °F×10 → convertir a °C
+
+_MLG_MAGIC      = b'MLVLG'
+_MLG_HDR_SIZE   = 24
+_MLG_CH_SIZE    = 89
+_MLG_REC_PREFIX = 5         # bytes de prefijo por record (flags/secuencia)
+_MLG_TEMP_CH    = {'CLT', 'MAT'}   # almacenados en °F×10, MSL muestra °C
+
+# Columnas MLG → clave interna (para load_mlg_full / diagnóstico de salud)
+_MLG_FULL_MAP = {
+    'RPM':                          'rpm',
+    'MAP':                          'map',
+    'AFR':                          'afr',
+    'TPS':                          'tps',
+    'CLT':                          'clt',
+    'MAT':                          'mat',
+    'Batt V':                       'batt',
+    'SPK: Spark Advance':           'adv',
+    'SPK: Knock retard':            'knock_retard',
+    'SPK: MAT Retard':              'mat_retard',
+    'SPK: Cold advance':            'cold_adv',
+    'SPK: Idle Correction Advance': 'idle_corr_adv',
+    'Fuel: Accel enrich':           'ae_pct',
+    'Fuel: Warmup cor':             'wue',
+    'Dwell':                        'dwell',
+    'DutyCycle1':                   'duty_cycle',
+    'PWM Idle Duty':                'iac_duty',
+    'Lost Sync Count':              'lost_sync',
+    'Timing Err%':                  'timing_err',
+    'Barometer':                    'baro',
+    'TPSdot':                       'tpsdot',
+    'MAPdot':                       'mapdot',
+    'RPMdot':                       'rpmdot',
+    'Accel PW':                     'accel_pw',
+    'PW':                           'pw',
+    'SecL':                         'secl',
+}
+
+
+def _mlg_ch_size(ctype: int) -> int:
+    return {0: 1, 1: 1, 2: 2, 3: 2, 4: 4, 5: 4, 6: 4, 7: 4}.get(ctype, 2)
+
+
+def _mlg_to_physical(name: str, ctype: int, raw) -> float:
+    """Convierte el valor raw MLG al valor físico con la escala correcta."""
+    if ctype == 7:
+        return float(raw)
+    if ctype in (0, 1):
+        return float(raw)
+    if ctype == 2:
+        return float(raw)          # uint16 escala 1:1 (RPM, SecL, etc.)
+    if ctype == 3:
+        val = raw / 10.0           # uint16 escala 0.1
+        if name in _MLG_TEMP_CH:
+            val = (val - 32.0) / 1.8   # °F × 10 → °C
+        return val
+    return float(raw)
+
+
+def _mlg_parse_header(raw: bytes):
+    """Parsea el header MLVLG. Retorna (channels, data_start) o (None, None)."""
+    if not raw.startswith(_MLG_MAGIC):
+        return None, None
+    n_ch = struct.unpack_from('>H', raw, 20)[0]
+    channels = []
+    for i in range(n_ch):
+        off = _MLG_HDR_SIZE + i * _MLG_CH_SIZE
+        if off + _MLG_CH_SIZE > len(raw):
+            break
+        ctype = raw[off]
+        name  = raw[off+1 : off+35].split(b'\x00')[0].decode('latin-1', errors='replace').strip()
+        units = raw[off+35: off+69].split(b'\x00')[0].decode('latin-1', errors='replace').strip()
+        channels.append({'type': ctype, 'name': name, 'units': units,
+                         'size': _mlg_ch_size(ctype)})
+    msq_end = raw.find(b'</msq>')
+    if msq_end < 0:
+        return channels, None
+    data_start = msq_end + len(b'</msq>') + 2   # skip \r\n
+    return channels, data_start
+
+
+def _mlg_iter_records(raw: bytes, channels: list, data_start: int):
+    """Itera los records binarios del MLG, yielding dicts con valores físicos."""
+    rec_data  = sum(ch['size'] for ch in channels)
+    rec_total = _MLG_REC_PREFIX + rec_data
+    data      = raw[data_start:]
+    n_rec     = len(data) // rec_total
+
+    for r in range(n_rec):
+        base = r * rec_total + _MLG_REC_PREFIX   # saltar prefijo
+        row  = {}
+        off  = base
+        for ch in channels:
+            sz    = ch['size']
+            chunk = data[off: off + sz]
+            if len(chunk) < sz:
+                break
+            ctype = ch['type']
+            try:
+                if ctype == 7:
+                    val_raw = struct.unpack_from('>f', chunk)[0]
+                elif sz == 1:
+                    val_raw = chunk[0]
+                elif sz == 2:
+                    val_raw = struct.unpack_from('>H', chunk)[0]
+                else:
+                    val_raw = struct.unpack_from('>I', chunk)[0]
+            except struct.error:
+                break
+            row[ch['name']] = _mlg_to_physical(ch['name'], ctype, val_raw)
+            off += sz
+        if row:
+            yield row
+
+
+def load_mlg_full(log_files: list) -> list:
+    """Equivalente a load_msl_full para archivos .mlg (diagnóstico de salud)."""
+    all_rows = []
+    for fi, fname in enumerate(log_files):
+        with open(fname, 'rb') as fh:
+            raw = fh.read()
+        channels, data_start = _mlg_parse_header(raw)
+        if channels is None or data_start is None:
+            print(f"  [!] No se pudo leer {os.path.basename(fname)} como MLG.")
+            continue
+        for row_raw in _mlg_iter_records(raw, channels, data_start):
+            row = {key: row_raw.get(mlg_name)
+                   for mlg_name, key in _MLG_FULL_MAP.items()}
+            row['file_idx'] = fi
+            all_rows.append(row)
+    return all_rows
 
 
 # ─────────────────────────────────────────────
@@ -100,9 +244,61 @@ def load_msl_logs(log_files: list, include_idle: bool = False) -> list:
     RPM 600-1200, sin AE, MAP estable) además de las de carga normal.
     """
     all_rows = []
-    for fname in log_files:
+    for fi, fname in enumerate(log_files):
         with open(fname, 'rb') as fh:
             raw = fh.read()
+
+        # ── Formato MLG (binario MLVLG) ──────────────────────────
+        if raw.startswith(_MLG_MAGIC):
+            channels, data_start = _mlg_parse_header(raw)
+            if channels is None or data_start is None:
+                print(f"  [!] {os.path.basename(fname)}: MLG sin sección de datos, omitiendo.")
+                continue
+            rec_size = _MLG_REC_PREFIX + sum(ch['size'] for ch in channels)
+            n_rec    = (len(raw) - data_start) // rec_size
+            print(f"  {os.path.basename(fname)}: {len(channels)} canales, {n_rec} records (MLG)")
+            for row_raw in _mlg_iter_records(raw, channels, data_start):
+                rpm      = row_raw.get('RPM', 0)
+                afr      = row_raw.get('AFR', 0)
+                clt      = row_raw.get('CLT', 0)
+                tps      = row_raw.get('TPS', 0)
+                accel_pw = row_raw.get('Accel PW', 0)
+                rpmdot   = row_raw.get('RPMdot', 0)
+                mat      = row_raw.get('MAT')
+                if rpm < 400 or not (8.0 < afr < 20.0) or clt < 70:
+                    continue
+                if tps < 3.0:
+                    if include_idle:
+                        mapdot = row_raw.get('MAPdot', 0)
+                        if not (clt > 70 and 600 < rpm < 1200
+                                and accel_pw <= 0.05 and abs(mapdot) < 15):
+                            continue
+                    else:
+                        continue
+                else:
+                    if accel_pw > 0.05:
+                        continue
+                    if abs(rpmdot) > 400:
+                        continue
+                if mat is not None and not (38.0 <= mat <= 58.0):
+                    continue
+                all_rows.append({
+                    'rpm':      rpm,
+                    'map':      row_raw.get('MAP', 0),
+                    'afr':      afr,
+                    'tps':      tps,
+                    'clt':      clt,
+                    'mat':      mat,
+                    'tpsdot':   row_raw.get('TPSdot', 0),
+                    'mapdot':   row_raw.get('MAPdot', 0),
+                    'rpmdot':   rpmdot,
+                    'accel_pw': accel_pw,
+                    'ego_cor':  row_raw.get('EGO cor1', 100.0),
+                    'file_idx': fi,
+                })
+            continue   # no procesar como MSL
+
+        # ── Formato MSL (texto tab-delimitado con header binario) ─
         text_start = raw.find(b'Time')
         if text_start < 0:
             print(f"  [!] No se encontró header en {fname}, omitiendo.")
@@ -191,7 +387,10 @@ def target_afr(map_kpa: float) -> float:
     if map_kpa <= 40:  return 14.5   # vacío / crucero ligero
     if map_kpa <= 55:  return 14.2   # crucero medio
     if map_kpa <= 75:  return 13.8   # carga media
-    return 13.0                       # carga alta / WOT
+    if map_kpa <= 100: return 13.0   # WOT NA
+    if map_kpa <= 130: return 12.5   # boost bajo / transición (~1-4 PSI)
+    if map_kpa <= 165: return 12.0   # boost medio (~7 PSI)
+    return 11.5                       # boost alto (~12 PSI)
 
 
 def zone_min_samples(map_kpa: float, base: int) -> int:
@@ -846,6 +1045,19 @@ def load_msl_full(log_files: list) -> list:
     for fi, fname in enumerate(log_files):
         with open(fname, 'rb') as fh:
             raw = fh.read()
+
+        # ── Formato MLG ──────────────────────────────────────────
+        if raw.startswith(_MLG_MAGIC):
+            channels, data_start = _mlg_parse_header(raw)
+            if channels and data_start is not None:
+                for row_raw in _mlg_iter_records(raw, channels, data_start):
+                    row = {key: row_raw.get(mlg_name)
+                           for mlg_name, key in _MLG_FULL_MAP.items()}
+                    row['file_idx'] = fi
+                    all_rows.append(row)
+            continue
+
+        # ── Formato MSL ──────────────────────────────────────────
         text_start = raw.find(b'Time')
         if text_start < 0:
             continue
@@ -901,8 +1113,8 @@ def analyze_health(rows: list) -> dict:
         return [r[key] for r in src if r.get(key) is not None]
 
     # ── Segmentos base reutilizables ──
-    # Motor en marcha (no cranking)
-    running   = [r for r in rows if (r.get('rpm') or 0) > 600]
+    # Motor en marcha (no cranking) — cap RPM < 10000 descarta registros MLG basura
+    running   = [r for r in rows if 600 < (r.get('rpm') or 0) < 10000]
     # Cranking: motor intentando arrancar
     cranking  = [r for r in rows if 50 < (r.get('rpm') or 0) <= 600]
     # Motor caliente en marcha
@@ -914,9 +1126,10 @@ def analyze_health(rows: list) -> dict:
 
     # ── VOLTAJE ──
     # Solo evaluado con motor en marcha — cranking siempre baja voltaje (normal)
-    batt_run  = fv('batt', running)
-    batt_warm = fv('batt', warm_run)
-    batt_all  = fv('batt')
+    # Filtro 5-30V: excluye valores basura de registros MLG con motor apagado
+    batt_run  = [v for v in fv('batt', running)  if 5 < v < 30]
+    batt_warm = [v for v in fv('batt', warm_run) if 5 < v < 30]
+    batt_all  = [v for v in fv('batt')           if 5 < v < 30]
     health['voltage'] = {
         'n':              len(batt_all),
         'avg_running':    _mean(batt_run),
