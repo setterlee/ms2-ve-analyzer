@@ -17,6 +17,26 @@ Descarga el ejecutable para tu sistema operativo desde la sección **Releases** 
 
 Coloca el ejecutable en la misma carpeta donde está tu `CurrentTune.msq` y la carpeta `DataLogs/`. La aplicación los detecta automáticamente al abrirse.
 
+### Aviso de SmartScreen en Windows
+
+Al ejecutar por primera vez, Windows puede mostrar el aviso **"Windows protegió tu PC"**. Esto ocurre porque el ejecutable no tiene firma digital de una empresa registrada — es normal en herramientas open source gratuitas.
+
+Para ejecutarlo:
+
+1. Clic en **"Más información"**
+2. Clic en **"Ejecutar de todas formas"**
+
+El código fuente de este proyecto es público y auditable en este mismo repositorio.
+
+### Aviso de Gatekeeper en macOS
+
+En macOS puede aparecer un aviso similar al abrir el `.app` por primera vez:
+
+1. Clic derecho en `VE-Analyzer.app` → **Abrir**
+2. Clic en **Abrir** en el diálogo de confirmación
+
+Solo es necesario la primera vez.
+
 ---
 
 ## Uso — Interfaz gráfica (GUI)
