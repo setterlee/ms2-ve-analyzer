@@ -132,15 +132,49 @@ La corrección es **idempotente**: el script siempre toma los valores base del M
 
 ## Condiciones para logs válidos
 
-Para que el análisis sea preciso:
+### Condiciones del motor
 
 - **Motor caliente:** CLT > 70°C antes de empezar a loguear
-- **Tarde o noche:** MAT estable entre 38–58°C (el script filtra automáticamente fuera de este rango)
+- **Temperatura de aire:** MAT estable entre 38–58°C — el script filtra muestras fuera de este rango automáticamente. Esto favorece logs nocturnos o en climas templados
 - **Voltaje estable:** alternador funcionando, > 13V con motor en marcha
-- **Perfil normal:** manejo urbano con variedad de cargas, aceleraciones parciales y plenas
-- **Evitar:** arranques en frío, carga sostenida al límite, temperatura ambiente extrema
+- **Tabla activa:** anota con qué tabla VE estabas corriendo (1 ó 3) y usa el parámetro `--table-num` correspondiente al analizar
 
-El script descarta automáticamente muestras con AE activo, desaceleraciones bruscas (RPMdot > 400), y TPS < 3% (excepto con `--include-idle`).
+### Perfil de manejo
+
+El script tiene tres filtros automáticos que descartan muestras no representativas. Para maximizar los datos útiles:
+
+**Sostén las condiciones al menos 2 segundos por zona.**
+El script exige que el motor permanezca en la misma celda MAP×RPM durante ≥ 2 segundos consecutivos antes de considerar esas muestras válidas. Las "pasadas rápidas" a través de una celda (aceleraciones suaves desde ralentí, cambios de marcha) se descartan automáticamente.
+
+**Evita cambios bruscos de MAP (MAPdot > 40 kPa/s).**
+Transitorios de carga donde el MAP sube rápido antes de que el RPM responda producen lecturas AFR lean artificiales. Abre el acelerador de forma progresiva y suave.
+
+**Varía la carga de forma controlada.**
+El perfil ideal incluye:
+- Crucero sostenido a distintas velocidades (MAP 40–80 kPa)
+- Aceleraciones parciales y plenas para cubrir zonas de alta carga
+- Algo de tráfico urbano para cubrir zonas bajas (MAP 30–55 kPa)
+
+### Qué evitar
+
+- Arranques en frío (CLT < 70°C)
+- Temperatura ambiente extrema (MAT fuera de 38–58°C)
+- Aceleraciones a fondo continuas o carga sostenida al límite
+- Conducción muy entrecortada (stop-and-go puro sin periodos de crucero)
+
+### Filtros automáticos
+
+El script descarta automáticamente:
+
+| Condición | Motivo |
+|-----------|--------|
+| AE activo (`Accel PW > 0.05 ms`) | El ECU añade combustible extra — el AFR no refleja el VE de la celda |
+| RPMdot > 400 RPM/s | Motor en desaceleración brusca — colector no está en estado estacionario |
+| MAPdot > 40 kPa/s | Transitorio de carga — MAP subiendo antes de que el RPM responda |
+| Permanencia < 2 s en la celda | Drive-through — el motor solo pasó por esa zona brevemente |
+| TPS < 3% | Decel o ralentí (excepto con `--include-idle`) |
+| MAT fuera de 38–58°C | Densidad de aire inestable |
+| CLT < 70°C | Motor frío — correcciones WUE activas distorsionan el AFR |
 
 ---
 
