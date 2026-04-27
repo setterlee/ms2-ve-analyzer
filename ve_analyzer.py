@@ -430,25 +430,22 @@ def cell_damping(mi: int, ri: int, history: list) -> float:
     return 0.5 if changes >= 1 else 1.0
 
 
-def _dwell_filter(samples: list, min_seconds: int = 2, max_rpm_rise: float = 80.0) -> list:
+def _dwell_filter(samples: list, min_seconds: int = 2) -> list:
     """
-    Filtra samples de una celda VE por permanencia mínima y estabilidad de RPM.
+    Filtra samples de una celda VE por permanencia mínima.
 
-    SecL en MegaSquirt es un entero en segundos (no sub-segundo). A 20 Hz hay
-    ~20 muestras por segundo con el mismo SecL. Por eso el criterio de
-    permanencia se define en segundos distintos, no en muestras:
+    SecL en MegaSquirt es un entero en segundos (no sub-segundo): a 20 Hz hay
+    ~20 muestras por segundo con el mismo SecL. Por eso el criterio usa
+    segundos distintos, no cantidad de muestras.
 
-    Un grupo de samples pasa el filtro si:
-      1. Abarca al menos min_seconds segundos distintos y consecutivos
-         (máximo salto de 1 s entre segundos adyacentes del grupo).
-      2. El RPM dentro del grupo NO muestra una tendencia monotónica de subida
-         sostenida: max(RPM) − min(RPM) > max_rpm_rise → transitorio de aceleración.
-         Si el rango de RPM es pequeño (≤ max_rpm_rise), se acepta como estable.
+    Un grupo de samples pasa si abarca al menos min_seconds segundos distintos
+    y consecutivos (máximo salto de 1 s entre segundos adyacentes del grupo).
 
-    Propósito: eliminar "drive-throughs" — celdas que el motor atraviesa durante
-    aceleraciones suaves desde ralentí (MAP=65 kPa mientras el RPM pasa de 850 a
-    1200 en 1–2 s). Estos dan AFR lean artificial por llenado de colector en
-    transitorio, no por VE insuficiente.
+    Propósito: eliminar "drive-throughs" de un solo segundo — celdas que el
+    motor visita brevemente durante una aceleración desde ralentí (MAP sube a
+    65 kPa mientras el RPM aún no respondió, dura < 1 s). Un dwell real de
+    ≥ 2 s indica que el motor efectivamente operó en esa celda en estado
+    estacionario (tráfico urbano lento, carga parcial sostenida, etc.).
 
     Si todos los SecL son 0 (log sin columna SecL), se omite el filtro.
     """
@@ -476,10 +473,7 @@ def _dwell_filter(samples: list, min_seconds: int = 2, max_rpm_rise: float = 80.
     for g in groups:
         secs = sorted({x['secl'] for x in g})
         if len(secs) < min_seconds:
-            continue   # menos de min_seconds segundos distintos → drive-through
-        rpms = [x.get('rpm', 0) for x in g if x.get('rpm')]
-        if rpms and (max(rpms) - min(rpms)) > max_rpm_rise:
-            continue   # rango RPM amplio → el motor está acelerando, no estable
+            continue   # menos de min_seconds segundos → drive-through de 1 s
         stable.extend(g)
 
     return stable
