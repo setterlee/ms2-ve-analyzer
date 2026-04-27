@@ -299,6 +299,7 @@ def load_msl_logs(log_files: list, include_idle: bool = False) -> list:
                     'rpmdot':   rpmdot,
                     'accel_pw': accel_pw,
                     'ego_cor':  row_raw.get('EGO cor1', 100.0),
+                    'secl':     row_raw.get('SecL', 0) or 0,
                     'file_idx': fi,
                 })
             continue   # no procesar como MSL
@@ -338,6 +339,7 @@ def load_msl_logs(log_files: list, include_idle: bool = False) -> list:
                     'rpmdot':   float(parts[cols['RPMdot']])   if 'RPMdot'    in cols else 0.0,
                     'accel_pw': float(parts[cols['Accel PW']]) if 'Accel PW'  in cols else 0.0,
                     'ego_cor':  float(parts[cols['EGO cor1']]) if 'EGO cor1'  in cols else 100.0,
+                    'secl':     float(parts[cols['SecL']])     if 'SecL'      in cols else 0.0,
                 }
             except (ValueError, IndexError):
                 continue
@@ -428,6 +430,61 @@ def cell_damping(mi: int, ri: int, history: list) -> float:
     return 0.5 if changes >= 1 else 1.0
 
 
+def _dwell_filter(samples: list, min_seconds: int = 2, max_rpm_rise: float = 80.0) -> list:
+    """
+    Filtra samples de una celda VE por permanencia mínima y estabilidad de RPM.
+
+    SecL en MegaSquirt es un entero en segundos (no sub-segundo). A 20 Hz hay
+    ~20 muestras por segundo con el mismo SecL. Por eso el criterio de
+    permanencia se define en segundos distintos, no en muestras:
+
+    Un grupo de samples pasa el filtro si:
+      1. Abarca al menos min_seconds segundos distintos y consecutivos
+         (máximo salto de 1 s entre segundos adyacentes del grupo).
+      2. El RPM dentro del grupo NO muestra una tendencia monotónica de subida
+         sostenida: max(RPM) − min(RPM) > max_rpm_rise → transitorio de aceleración.
+         Si el rango de RPM es pequeño (≤ max_rpm_rise), se acepta como estable.
+
+    Propósito: eliminar "drive-throughs" — celdas que el motor atraviesa durante
+    aceleraciones suaves desde ralentí (MAP=65 kPa mientras el RPM pasa de 850 a
+    1200 en 1–2 s). Estos dan AFR lean artificial por llenado de colector en
+    transitorio, no por VE insuficiente.
+
+    Si todos los SecL son 0 (log sin columna SecL), se omite el filtro.
+    """
+    if not samples:
+        return samples
+    if max(s['secl'] for s in samples) == 0:
+        return samples   # sin timestamps reales → no filtrar
+
+    s = sorted(samples, key=lambda x: (x['fi'], x['secl']))
+
+    # Agrupar por archivo y segundos consecutivos (gap ≤ 1 s)
+    groups = []
+    group  = [s[0]]
+    for i in range(1, len(s)):
+        same_file = s[i]['fi'] == s[i - 1]['fi']
+        gap_ok    = s[i]['secl'] - s[i - 1]['secl'] <= 1
+        if same_file and gap_ok:
+            group.append(s[i])
+        else:
+            groups.append(group)
+            group = [s[i]]
+    groups.append(group)
+
+    stable = []
+    for g in groups:
+        secs = sorted({x['secl'] for x in g})
+        if len(secs) < min_seconds:
+            continue   # menos de min_seconds segundos distintos → drive-through
+        rpms = [x.get('rpm', 0) for x in g if x.get('rpm')]
+        if rpms and (max(rpms) - min(rpms)) > max_rpm_rise:
+            continue   # rango RPM amplio → el motor está acelerando, no estable
+        stable.extend(g)
+
+    return stable
+
+
 def analyze(rows: list, ve_data: dict, ae_cfg: dict,
             min_samples: int = 5, history: list = None) -> dict:
     """Calcula AFR promedio por celda, separando muestras con/sin AE activo."""
@@ -443,12 +500,18 @@ def analyze(rows: list, ve_data: dict, ae_cfg: dict,
     # Falsos positivos AE: accel_pw > 0 pero tpsdot bajo (período de tapering)
     ae_taper = [r for r in ae_on if abs(r['tpsdot']) < tps_thresh]
 
-    # Acumular AFR por celda (solo sin AE para correcciones limpias)
-    cell_afrs = {}
+    # Acumular samples por celda (solo sin AE para correcciones limpias)
+    # Guardamos dicts completos para poder aplicar el filtro de permanencia.
+    cell_samples = {}
     for row in ae_off:
         mi = find_bin(row['map'], map_bins)
         ri = find_bin(row['rpm'], rpm_bins)
-        cell_afrs.setdefault((mi, ri), []).append(row['afr'])
+        cell_samples.setdefault((mi, ri), []).append({
+            'afr':  row['afr'],
+            'rpm':  row['rpm'],
+            'fi':   row.get('file_idx', 0),
+            'secl': row.get('secl', 0) or 0,
+        })
 
     # Calcular correcciones
     lean_cells = []
@@ -456,10 +519,15 @@ def analyze(rows: list, ve_data: dict, ae_cfg: dict,
     ok_cells   = []
     skipped    = []
 
-    for (mi, ri), afrs in sorted(cell_afrs.items()):
+    for (mi, ri), raw_samples in sorted(cell_samples.items()):
         m   = map_bins[mi]
         r   = rpm_bins[ri]
         req = zone_min_samples(m, min_samples)
+
+        # Filtro de permanencia mínima: descartar "drive-throughs"
+        stable = _dwell_filter(raw_samples)
+        afrs   = [s['afr'] for s in stable]
+
         if len(afrs) < req:
             continue
 
@@ -474,6 +542,7 @@ def analyze(rows: list, ve_data: dict, ae_cfg: dict,
         entry = {
             'mi': mi, 'ri': ri, 'map': m, 'rpm': r,
             'afr_avg': avg, 'target': tgt, 'n': len(afrs),
+            'n_raw': len(raw_samples),
             've_cur': vc, 've_new': vn, 'delta': delta,
             'damped': damp < 1.0,
         }
