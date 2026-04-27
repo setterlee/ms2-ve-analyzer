@@ -69,6 +69,7 @@ _MLG_FULL_MAP = {
     'Accel PW':                     'accel_pw',
     'PW':                           'pw',
     'SecL':                         'secl',
+    'OilPressure':                  'oil_pressure',
 }
 
 
@@ -280,6 +281,10 @@ def load_msl_logs(log_files: list, include_idle: bool = False) -> list:
                         continue
                     if abs(rpmdot) > 400:
                         continue
+                    # Excluir transitorios de carga: MAP cambiando rápido = estado no estacionario
+                    mapdot = row_raw.get('MAPdot', 0)
+                    if abs(mapdot) > 40:
+                        continue
                 if mat is not None and not (38.0 <= mat <= 58.0):
                     continue
                 all_rows.append({
@@ -360,9 +365,14 @@ def load_msl_logs(log_files: list, include_idle: bool = False) -> list:
                 # del VE — el AFR no refleja el VE de la celda sino el transitorio.
                 # RPMdot < -400: motor pasando por la celda en desaceleración;
                 # el llenado del colector no está en estado estacionario.
+                # MAPdot > 40: MAP cambiando rápido = transitorio de carga (ej: carga
+                # subiendo a RPM bajos antes de que el motor responda); no es estado
+                # estacionario y puede dar AFR lean transitorio.
                 if row.get('accel_pw', 0) > 0.05:
                     continue
                 if abs(row.get('rpmdot', 0)) > 400:
+                    continue
+                if abs(row.get('mapdot', 0)) > 40:
                     continue
             # Filtro MAT: solo rango térmico estabilizado (evita oscilación por densidad)
             mat = row.get('mat')
@@ -1040,6 +1050,7 @@ def load_msl_full(log_files: list) -> list:
         'PW':                         'pw',
         'SecL':                       'secl',
         'fuel_pressure':              'fuel_pressure',
+        'OilPressure':                'oil_pressure',
     }
     all_rows = []
     for fi, fname in enumerate(log_files):
@@ -1427,6 +1438,53 @@ def analyze_health(rows: list) -> dict:
         'has_fp_sensor':  has_fp_sensor,
     }
 
+    # ── PRESIÓN DE ACEITE vs RPM ──
+    # Sensor OilPressure en PSI. Solo con motor caliente (CLT>70°C).
+    # La presión de aceite debe subir con las RPM; presión baja en ralentí
+    # puede indicar bomba desgastada, strainer obstruido, o rodamientos flojos.
+    OIL_VALID_PSI = (5, 120)
+    OIL_RPM_BUCKETS = [(600, 1000), (1000, 1500), (1500, 2000),
+                       (2000, 2800), (2800, 4500)]
+
+    oil_rows = [r for r in warm_run
+                if r.get('oil_pressure') is not None
+                and OIL_VALID_PSI[0] < r['oil_pressure'] < OIL_VALID_PSI[1]]
+
+    has_oil = len(oil_rows) > 10
+    oil_buckets = []
+
+    if has_oil:
+        for lo, hi in OIL_RPM_BUCKETS:
+            bucket = [r for r in oil_rows if lo <= (r.get('rpm') or 0) < hi]
+            if len(bucket) < 10:
+                continue
+            vals = [r['oil_pressure'] for r in bucket]
+            oil_buckets.append({
+                'lo': lo, 'hi': hi,
+                'mid': (lo + hi) / 2,
+                'n':    len(bucket),
+                'avg':  _mean(vals),
+                'min':  min(vals),
+                'max':  max(vals),
+                'std':  _stdev(vals),
+            })
+
+    oil_slope = None
+    if len(oil_buckets) >= 3:
+        rpms = [b['mid'] for b in oil_buckets]
+        oils = [b['avg'] for b in oil_buckets]
+        mx = _mean(rpms); mv = _mean(oils)
+        num = sum((rpms[i] - mx) * (oils[i] - mv) for i in range(len(rpms)))
+        den = sum((rpms[i] - mx) ** 2              for i in range(len(rpms)))
+        oil_slope = num / den if den > 0 else 0.0
+
+    health['oil_pressure'] = {
+        'has_sensor':  has_oil,
+        'n_total':     len(oil_rows),
+        'buckets':     oil_buckets,
+        'slope':       oil_slope,
+    }
+
     health['n_total'] = n_total
     return health
 
@@ -1737,6 +1795,50 @@ def _fmt_health_report(health: dict, log_files: list, timestamp: str) -> str:
         else:
             row(f"\n  Sin tendencia sistemática por MAP   ✓")
             note("Comportamiento consistente con regulador 1:1 funcionando")
+
+    # ── PRESIÓN DE ACEITE ──
+    # Umbrales proporcionales al RPM (PSI mínimo esperado para 4G15):
+    #   600-1000: >=10 PSI   1000-1500: >=15   1500-2000: >=20
+    #   2000-2800: >=28      2800-4500: >=38
+    OIL_MIN = {(600,1000):10, (1000,1500):15, (1500,2000):20,
+               (2000,2800):28, (2800,4500):38}
+
+    sec('PRESIÓN DE ACEITE vs RPM  (motor caliente, PSI)')
+    op = health.get('oil_pressure', {})
+    if not op.get('has_sensor'):
+        row('Sin canal OilPressure en los logs.')
+        note('Conectar sensor de presión de aceite para monitoreo de salud mecánica')
+    elif not op.get('buckets'):
+        row(f"Sensor detectado pero muestras insuficientes ({op.get('n_total',0)}) con motor caliente")
+    else:
+        row(f"Muestras válidas (CLT>70°C): {op['n_total']:,}")
+        row(f"  {'Rango RPM':>14}  {'n':>5}  {'Prom':>7}  {'Min':>7}  {'Max':>7}  {'std':>6}  {'Mín OK?':>9}")
+        row('  ' + '─' * 66)
+        for b in op['buckets']:
+            min_ok = OIL_MIN.get((b['lo'], b['hi']), 10)
+            flag   = '  ⚠' if b['avg'] < min_ok else '  ✓'
+            row(f"  {b['lo']:.0f}–{b['hi']:.0f} RPM:"
+                f"  {b['n']:>5}  {b['avg']:>7.1f}  "
+                f"{b['min']:>7.1f}  {b['max']:>7.1f}  {b['std']:>6.1f}"
+                f"  >={min_ok} PSI{flag}")
+
+        slope  = op.get('slope')
+        idle_b = next((b for b in op['buckets'] if b['lo'] < 1000), None)
+        if idle_b:
+            if idle_b['avg'] < 7:
+                row(f"\n  Presión en ralentí: {idle_b['avg']:.1f} PSI   ⚠ CRÍTICO — PARAR MOTOR")
+            elif idle_b['avg'] < 10:
+                row(f"\n  Presión en ralentí: {idle_b['avg']:.1f} PSI   ⚠ BAJA")
+                note('Verificar nivel de aceite, bomba y rodamientos')
+            else:
+                row(f"\n  Presión en ralentí: {idle_b['avg']:.1f} PSI   ✓")
+
+        if slope is not None:
+            if slope < 0.003:
+                row(f"  Presión no sube con RPM (slope={slope:+.4f} PSI/RPM)   ⚠ REVISAR")
+                note('Posible strainer obstruido o bomba desgastada')
+            else:
+                row(f"  Presión aumenta con RPM (slope={slope:+.4f} PSI/RPM)   ✓")
 
     lines.append('')
     return '\n'.join(lines)
