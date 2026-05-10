@@ -63,6 +63,21 @@ Clic en **Calibrar AE** para analizar eventos de aceleración y obtener sugerenc
 
 Después de varias sesiones de corrección, clic en **Suavizar tabla VE** para generar una tabla suavizada que pondera el historial de correcciones y limita gradientes bruscos entre celdas vecinas.
 
+### Tabla definitiva (fusión + proyección)
+
+Clic en **Tabla definitiva** para fusionar todas las `_corrected.table` del flujo en una sola tabla que proyecta matemáticamente las correcciones a las celdas sin datos directos.
+
+A diferencia de **Suavizar**, que pondera el historial pero deja sin tocar las celdas que nunca fueron corregidas, **Tabla definitiva** asume que el motor está lean **globalmente** (sesgo del `reqFuel` base) y aplica el factor de corrección detectado a TODA la tabla — útil cuando sospechas que zonas sin logs (WOT, idle) también necesitan ajuste.
+
+**Algoritmo:**
+1. Calcula factor multiplicativo por celda (Tn/T1) en celdas tocadas.
+2. Cap outliers (factor > ×1.20) al P75 normal — evita propagar picos artificiales.
+3. Para celdas no tocadas: mezcla suave entre **IDW Shepard** (vecinos tocados, peso 1/d²) y **factor base = mediana P50** según distancia Chebyshev.
+4. Suaviza gradiente (máx 8 puntos VE entre adyacentes).
+5. Blend liviano (20% vecinos 3×3) solo en celdas proyectadas.
+
+Genera `veTable{N}Tbl_<timestamp>_definitive.table` lista para importar a TunerStudio.
+
 ---
 
 ## Uso — Línea de comandos (CLI)
@@ -91,6 +106,12 @@ python3 ve_analyzer.py --save-report --latest 3
 # Suavizar tabla VE (usa el historial de _corrected.table)
 python3 ve_analyzer.py --smooth --table-num 1
 
+# Generar tabla definitiva fusionando todas las _corrected.table con proyección
+python3 ve_analyzer.py --fuse-definitive --table-num 3
+
+# Tabla definitiva más agresiva (usar P75 en vez de P50 como factor base)
+python3 ve_analyzer.py --fuse-definitive --table-num 3 --base-percentile 0.75
+
 # Calibración AE
 python3 ve_analyzer.py --ae-cal --latest 5
 ```
@@ -105,6 +126,8 @@ python3 ve_analyzer.py --ae-cal --latest 5
 | `--min-samples N` | Mínimo de muestras por celda para aplicar corrección (default: 20) |
 | `--include-idle` | Incluir celdas de ralentí (TPS < 3%) en las correcciones |
 | `--smooth` | Generar tabla suavizada desde el historial de correcciones |
+| `--fuse-definitive` | Fusionar todas las `_corrected.table` con proyección matemática a celdas sin datos |
+| `--base-percentile P` | Percentil del factor lean a usar como base global (default: 0.50 = mediana) |
 | `--health-only` | Solo mostrar diagnóstico de salud, sin análisis VE |
 | `--no-health` | Omitir el diagnóstico de salud |
 | `--save-report` | Guardar diagnóstico de salud como `.md` |

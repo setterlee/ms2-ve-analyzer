@@ -25,7 +25,7 @@ else:
 from ve_analyzer import (
     load_ve_table, load_ae_config,
     load_msl_logs, load_msl_full, load_mlg_full,
-    analyze, generate_table, smooth_table,
+    analyze, generate_table, smooth_table, fuse_definitive_table,
     load_history_from_tables, check_effectiveness,
     analyze_health, _fmt_health_report,
     detect_ae_events, analyze_ae_calibration, print_ae_calibration,
@@ -204,6 +204,10 @@ class VEAnalyzerApp:
                                       command=self._smooth)
         self._btn_smooth.pack(fill=tk.X, pady=2)
 
+        self._btn_fuse = ttk.Button(a, text="Tabla definitiva",
+                                    command=self._fuse_definitive)
+        self._btn_fuse.pack(fill=tk.X, pady=2)
+
     def _build_right(self, parent):
         self._nb = ttk.Notebook(parent)
         self._nb.pack(fill=tk.BOTH, expand=True)
@@ -315,7 +319,7 @@ class VEAnalyzerApp:
     def _lock(self, locked: bool):
         state = tk.DISABLED if locked else tk.NORMAL
         for b in (self._btn_analyze, self._btn_health,
-                  self._btn_ae, self._btn_smooth):
+                  self._btn_ae, self._btn_smooth, self._btn_fuse):
             b.configure(state=state)
         if locked:
             self._btn_gen.configure(state=tk.DISABLED)
@@ -556,6 +560,33 @@ class VEAnalyzerApp:
         self._run_in_thread(_do, lambda: (
             self._lock(False),
             self._status.set("Tabla suavizada. Archivo _smoothed.table guardado."),
+            self._nb.select(self._txt_log)
+        ))
+
+    # ── Tabla definitiva (fusión + proyección) ───────────────────────────────
+
+    def _fuse_definitive(self):
+        proj = self._project_dir.get()
+        if not proj:
+            messagebox.showerror("Error", "Selecciona el directorio del proyecto.")
+            return
+        table_dir = str(Path(proj) / 've-calibration-process')
+        if not Path(table_dir).is_dir():
+            messagebox.showerror(
+                "Error",
+                f"No existe directorio:\n{table_dir}\n\n"
+                "Primero genera al menos 2 tablas _corrected con 'Generar tabla corregida'.")
+            return
+        self._lock(True)
+        self._status.set("Generando tabla definitiva…")
+        self._set_txt(self._txt_log, "")
+
+        def _do():
+            fuse_definitive_table(table_dir, self._table_num.get())
+
+        self._run_in_thread(_do, lambda: (
+            self._lock(False),
+            self._status.set("Tabla definitiva generada. Archivo _definitive.table guardado."),
             self._nb.select(self._txt_log)
         ))
 

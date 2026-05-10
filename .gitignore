@@ -1,9 +1,9 @@
 # ── Datos personales del tune (no publicar) ────────────────────────────────
 *.msq
 restorePoints/
-DataLogs/
+DataLogs*
 Tables/
-ve-calibration-process/
+ve-calibration-process*
 REVISIONES_PENDIENTES.md
 std_ms2geno2.log
 
