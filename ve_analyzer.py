@@ -998,6 +998,264 @@ def smooth_table(project_dir: str, table_num: int) -> None:
     print(f"\n  Tabla suavizada guardada: {os.path.basename(out)}")
 
 
+def fuse_definitive_table(project_dir: str, table_num: int = 3,
+                          base_percentile: float = 0.50,
+                          near_radius: int = 4,
+                          outlier_factor_threshold: float = 1.20,
+                          max_gradient: float = 8.0,
+                          blend_neighbor_weight: float = 0.20) -> None:
+    """
+    Genera una tabla VE definitiva fusionando TODAS las _corrected.table del flujo.
+
+    Estrategia:
+    1. T1 = primera _corrected (estado tras primer log)
+       T6 = última _corrected (estado actual)
+    2. Factor multiplicativo por celda: factor[mi][ri] = T6/T1
+    3. Cap outliers: factor > outlier_factor_threshold → P75 normal
+    4. Para celdas no tocadas: factor proyectado mezclando IDW (vecinos tocados,
+       peso 1/d²) con factor base (P50 — mediana del lean global detectado).
+       Mezcla suave α = max(0, 1 − (d_nearest−1)/(near_radius−1)).
+    5. Aplicar factor: tocadas → T6 (con outlier limpiado), no tocadas → T6×factor
+    6. Suavizar gradiente: máx max_gradient puntos VE entre celdas adyacentes
+    7. Blend liviano (blend_neighbor_weight vecinos 3×3) solo en no tocadas
+
+    Hipótesis: el motor está lean GLOBALMENTE por sesgo del reqFuel base. El
+    lean detectado en celdas con datos se proyecta al resto de la tabla.
+    """
+    pattern = os.path.join(project_dir, f'veTable{table_num}Tbl_*_corrected.table')
+    files   = sorted(glob.glob(pattern), key=os.path.getmtime)
+
+    if len(files) < 2:
+        print(f"  Se necesitan al menos 2 archivos _corrected.table "
+              f"(encontrados: {len(files)})")
+        return
+
+    print(f"\n── FUSIÓN DEFINITIVA — Tabla VE{table_num} ─────────────────")
+    print(f"  Tablas en flujo: {len(files)}")
+    print(f"  Primera (T1) : {os.path.basename(files[0])}")
+    print(f"  Última (Tn)  : {os.path.basename(files[-1])}")
+
+    t1 = _parse_table_file(files[0])
+    tn = _parse_table_file(files[-1])
+    if not (t1 and tn):
+        print("  Error leyendo archivos")
+        return
+
+    rpm_bins = t1['rpm_bins']
+    map_bins = t1['map_bins']
+    n_cols = len(rpm_bins)
+    n_rows = len(map_bins)
+
+    T1 = [t1['values'][mi*n_cols:(mi+1)*n_cols] for mi in range(n_rows)]
+    T6 = [tn['values'][mi*n_cols:(mi+1)*n_cols] for mi in range(n_rows)]
+
+    # ── 1. Factor por celda + identificar tocadas ──
+    factor  = [[T6[mi][ri]/T1[mi][ri] if T1[mi][ri] > 0 else 1.0
+                for ri in range(n_cols)] for mi in range(n_rows)]
+    touched = [[abs(T6[mi][ri] - T1[mi][ri]) >= 0.5
+                for ri in range(n_cols)] for mi in range(n_rows)]
+
+    touched_cells = [(mi, ri) for mi in range(n_rows) for ri in range(n_cols)
+                     if touched[mi][ri]]
+
+    if not touched_cells:
+        print("  No hay diferencias entre T1 y Tn → no hay datos para fusionar")
+        return
+
+    # ── 2. Percentiles de factor normal + cap outliers ──
+    factors_normal = sorted(factor[mi][ri] for mi, ri in touched_cells
+                            if factor[mi][ri] < outlier_factor_threshold)
+    if not factors_normal:
+        print("  Todos los factores son outliers → no se puede determinar P50")
+        return
+
+    def percentile(arr, p):
+        return arr[min(int(len(arr)*p), len(arr)-1)]
+
+    p25 = percentile(factors_normal, 0.25)
+    p50 = percentile(factors_normal, 0.50)
+    p75 = percentile(factors_normal, 0.75)
+    base_factor = percentile(factors_normal, base_percentile)
+
+    print(f"  Celdas con datos directos: {len(touched_cells)} / {n_rows*n_cols}")
+    print(f"  Factores normales: P25=×{p25:.3f}  P50=×{p50:.3f}  P75=×{p75:.3f}")
+    print(f"  Factor base aplicado a toda la tabla: ×{base_factor:.3f} "
+          f"(percentil {base_percentile*100:.0f}, lean +{(base_factor-1)*100:.1f}%)")
+
+    # Cap outliers
+    clean_factor = [row[:] for row in factor]
+    outliers_capped = []
+    for mi in range(n_rows):
+        for ri in range(n_cols):
+            if factor[mi][ri] > outlier_factor_threshold:
+                clean_factor[mi][ri] = p75
+                outliers_capped.append((mi, ri, factor[mi][ri], p75))
+
+    if outliers_capped:
+        print(f"\n  Outliers capados (factor > ×{outlier_factor_threshold:.2f}):")
+        for mi, ri, orig, capped in outliers_capped:
+            ve_orig = T6[mi][ri]
+            ve_new  = T1[mi][ri] * capped
+            print(f"    MAP={map_bins[mi]:>5.0f} RPM={rpm_bins[ri]:>5}: "
+                  f"×{orig:.3f} → ×{capped:.3f}  (VE {ve_orig:.0f} → {ve_new:.0f})")
+
+    # ── 3. Proyección de factor a celdas no tocadas ──
+    def cheb(a, b):
+        return max(abs(a[0]-b[0]), abs(a[1]-b[1]))
+
+    projected_factor = [[base_factor]*n_cols for _ in range(n_rows)]
+    for mi in range(n_rows):
+        for ri in range(n_cols):
+            if touched[mi][ri]:
+                projected_factor[mi][ri] = clean_factor[mi][ri]
+                continue
+            ws, fs = 0.0, 0.0
+            nearest = None
+            for tmi, tri in touched_cells:
+                d = cheb((mi, ri), (tmi, tri))
+                if nearest is None or d < nearest:
+                    nearest = d
+                if d > near_radius:
+                    continue
+                w = 1.0 / (d * d)
+                ws += w * clean_factor[tmi][tri]
+                fs += w
+            if fs > 0:
+                idw = ws / fs
+                # Mezcla IDW (cerca) ↔ base_factor (lejos)
+                alpha = max(0.0, 1.0 - (nearest - 1) / max(near_radius - 1, 1))
+                projected_factor[mi][ri] = idw*alpha + base_factor*(1.0 - alpha)
+            else:
+                projected_factor[mi][ri] = base_factor
+
+    # ── 4. Aplicar factor ──
+    ve_proj = [[0.0]*n_cols for _ in range(n_rows)]
+    for mi in range(n_rows):
+        for ri in range(n_cols):
+            if touched[mi][ri] and factor[mi][ri] > outlier_factor_threshold:
+                ve_proj[mi][ri] = T1[mi][ri] * clean_factor[mi][ri]
+            elif touched[mi][ri]:
+                ve_proj[mi][ri] = T6[mi][ri]
+            else:
+                ve_proj[mi][ri] = T6[mi][ri] * projected_factor[mi][ri]
+
+    # ── 5. Suavizado de gradiente máx max_gradient entre adyacentes ──
+    ve_smooth = [row[:] for row in ve_proj]
+    for _it in range(30):
+        chgd = False
+        for mi in range(n_rows):
+            for ri in range(n_cols):
+                for nmi, nri in [(mi-1, ri), (mi+1, ri), (mi, ri-1), (mi, ri+1)]:
+                    if not (0 <= nmi < n_rows and 0 <= nri < n_cols):
+                        continue
+                    diff = ve_smooth[mi][ri] - ve_smooth[nmi][nri]
+                    if abs(diff) > max_gradient:
+                        # Mover preferentemente celdas sin datos directos
+                        if not touched[mi][ri] and touched[nmi][nri]:
+                            ve_smooth[mi][ri] = ve_smooth[nmi][nri] + (
+                                max_gradient if diff > 0 else -max_gradient)
+                        elif touched[mi][ri] and not touched[nmi][nri]:
+                            ve_smooth[nmi][nri] = ve_smooth[mi][ri] + (
+                                -max_gradient if diff > 0 else max_gradient)
+                        else:
+                            if diff > 0:
+                                ve_smooth[mi][ri] -= 0.5
+                                ve_smooth[nmi][nri] += 0.5
+                            else:
+                                ve_smooth[mi][ri] += 0.5
+                                ve_smooth[nmi][nri] -= 0.5
+                        chgd = True
+        if not chgd:
+            break
+
+    # ── 6. Blend liviano (1 pasada) solo en celdas no tocadas ──
+    def neigh_avg_3x3(grid, mi, ri):
+        vals = []
+        for d_mi in (-1, 0, 1):
+            for d_ri in (-1, 0, 1):
+                if d_mi == 0 and d_ri == 0:
+                    continue
+                nmi, nri = mi + d_mi, ri + d_ri
+                if 0 <= nmi < n_rows and 0 <= nri < n_cols:
+                    vals.append(grid[nmi][nri])
+        return sum(vals)/len(vals) if vals else None
+
+    new = [row[:] for row in ve_smooth]
+    for mi in range(n_rows):
+        for ri in range(n_cols):
+            if touched[mi][ri]:
+                continue
+            navg = neigh_avg_3x3(ve_smooth, mi, ri)
+            if navg is None:
+                continue
+            new[mi][ri] = ve_smooth[mi][ri] * (1.0 - blend_neighbor_weight) \
+                          + navg * blend_neighbor_weight
+    ve_final = [[round(new[mi][ri], 1) for ri in range(n_cols)]
+                for mi in range(n_rows)]
+
+    # ── Estadísticas finales ──
+    cells_changed = 0
+    cells_projected = 0
+    for mi in range(n_rows):
+        for ri in range(n_cols):
+            if abs(ve_final[mi][ri] - T6[mi][ri]) >= 0.5:
+                cells_changed += 1
+                if not touched[mi][ri]:
+                    cells_projected += 1
+
+    print(f"\n  Celdas modificadas vs Tn: {cells_changed} / {n_rows*n_cols}")
+    print(f"  De ellas, proyectadas (sin datos directos): {cells_projected}")
+
+    # Picos residuales
+    peaks = []
+    for mi in range(n_rows):
+        for ri in range(n_cols):
+            avg = neigh_avg_3x3(ve_final, mi, ri)
+            if avg is not None and abs(ve_final[mi][ri] - avg) > 5:
+                peaks.append((mi, ri, ve_final[mi][ri], avg))
+    if peaks:
+        print(f"\n  Picos residuales (|cell − vecinos 3×3| > 5): {len(peaks)}")
+        for mi, ri, v, avg in peaks:
+            print(f"    MAP={map_bins[mi]:>5.0f} RPM={rpm_bins[ri]:>5}: "
+                  f"VE={v:.1f}  vecinos={avg:.1f}  Δ={v-avg:+.1f}")
+
+    # ── Guardar .table ──
+    ts  = datetime.now().strftime('%Y-%m-%d_%H.%M')
+    out = os.path.join(project_dir,
+                       f'veTable{table_num}Tbl_{ts}_definitive.table')
+
+    z_rows = "\n".join(
+        "         " + " ".join(f"{v:.1f}" for v in row) + " "
+        for row in ve_final
+    )
+    now_str = datetime.now().strftime("%a %b %d %H:%M:%S CLST %Y")
+    xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="no"?>\n'
+        '<tableData xmlns="http://www.EFIAnalytics.com/:table">\n'
+        f'<bibliography author="EFI Analytics - philip.tobin@yahoo.com"'
+        f' company="EFI Analytics, copyright 2010, All Rights Reserved."'
+        f' writeDate="{now_str}"/>\n'
+        '<versionInfo fileFormat="1.0"/>\n'
+        f'<table cols="{n_cols}" rows="{n_rows}">\n'
+        f'<xAxis cols="{n_cols}" name="rpm">\n'
+        + "\n".join(f"         {r} " for r in rpm_bins) + "\n"
+        '      </xAxis>\n'
+        f'<yAxis name="fuelload" rows="{n_rows}">\n'
+        + "\n".join(f"         {m} " for m in map_bins) + "\n"
+        '      </yAxis>\n'
+        f'<zValues cols="{n_cols}" rows="{n_rows}">\n'
+        f'{z_rows}\n'
+        '      </zValues>\n'
+        '</table>\n'
+        '</tableData>\n'
+    )
+    with open(out, 'w') as f:
+        f.write(xml)
+
+    print(f"\n  Tabla definitiva guardada: {os.path.basename(out)}")
+    print(f"  Importar a TunerStudio → Tabla VE {table_num} → Save MSQ.")
+
+
 def check_effectiveness(result: dict, history: list) -> list:
     """
     Para cada sesión del historial, evalúa el estado actual de las celdas
@@ -2421,6 +2679,12 @@ def main():
                         help='Solo mostrar diagnóstico de salud, sin análisis VE')
     parser.add_argument('--smooth', action='store_true',
                         help='Suavizar tabla VE usando historial de _corrected.table')
+    parser.add_argument('--fuse-definitive', action='store_true',
+                        help='Fusionar todas las _corrected.table en una tabla definitiva '
+                             'con proyección matemática del lean global a celdas sin datos')
+    parser.add_argument('--base-percentile', type=float, default=0.50,
+                        help='Percentil del factor lean a usar como base global '
+                             '(default: 0.50 = mediana; 0.75 = más agresivo)')
     parser.add_argument('--ae-cal', action='store_true',
                         help='Calibrar AE: analiza eventos de aceleración y sugiere nuevos taeBins/taeRates')
     parser.add_argument('--include-idle', action='store_true',
@@ -2437,6 +2701,12 @@ def main():
     # ── Suavizado de tabla (no requiere logs) ──
     if args.smooth:
         smooth_table(table_dir, table_num)
+        return
+
+    # ── Fusión definitiva (no requiere logs) ──
+    if args.fuse_definitive:
+        fuse_definitive_table(table_dir, table_num,
+                              base_percentile=args.base_percentile)
         return
 
     # ── Selección de logs ──
