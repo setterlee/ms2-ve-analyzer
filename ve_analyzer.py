@@ -551,9 +551,10 @@ def analyze(rows: list, ve_data: dict, ae_cfg: dict,
         delta = max(-MAX_DELTA, min(MAX_DELTA, round(raw_delta * damp)))
         vn    = round(vc) + delta
 
+        n_secs = len({s['secl'] for s in stable if s.get('secl', 0) > 0})
         entry = {
             'mi': mi, 'ri': ri, 'map': m, 'rpm': r,
-            'afr_avg': avg, 'target': tgt, 'n': len(afrs),
+            'afr_avg': avg, 'target': tgt, 'n': len(afrs), 'n_secs': n_secs,
             'n_raw': len(raw_samples),
             've_cur': vc, 've_new': vn, 'delta': delta,
             'damped': damp < 1.0,
@@ -641,17 +642,21 @@ def print_report(result: dict, ae_cfg: dict, log_files: list, ve_data: dict,
     print(f"  Tapering (tpsdot<thresh con AE>0): {ae['taper_pct']:.0f}% del AE total")
     print()
 
+    def _fmt_n(c):
+        n, s = c['n'], c.get('n_secs', 0)
+        return f"{n}(~{s}s)" if s else str(n)
+
     def table_header():
-        print(f"  {'MAP':>5} {'RPM':>6} {'AFR':>7} {'Target':>7} {'n':>5}  "
+        print(f"  {'MAP':>5} {'RPM':>6} {'AFR':>7} {'Target':>7} {'n(~s)':>9}  "
               f"{'VE_act':>6} {'VE_nuevo':>8} {'Δ':>4}")
-        print("  " + "-"*54)
+        print("  " + "-"*58)
 
     if lean:
         print(f"── ZONAS POBRES (AFR>14.5) — {len(lean)} celdas ──────────")
         table_header()
         for c in sorted(lean, key=lambda x: -x['delta']):
             print(f"  {c['map']:>5.0f} {c['rpm']:>6} {c['afr_avg']:>7.2f} "
-                  f"{c['target']:>7.1f} {c['n']:>5}  "
+                  f"{c['target']:>7.1f} {_fmt_n(c):>9}  "
                   f"{c['ve_cur']:>6.0f} {c['ve_new']:>8} {c['delta']:>+4}")
         print()
 
@@ -660,7 +665,7 @@ def print_report(result: dict, ae_cfg: dict, log_files: list, ve_data: dict,
         table_header()
         for c in sorted(rich, key=lambda x: x['delta']):
             print(f"  {c['map']:>5.0f} {c['rpm']:>6} {c['afr_avg']:>7.2f} "
-                  f"{c['target']:>7.1f} {c['n']:>5}  "
+                  f"{c['target']:>7.1f} {_fmt_n(c):>9}  "
                   f"{c['ve_cur']:>6.0f} {c['ve_new']:>8} {c['delta']:>+4}")
         print()
 
