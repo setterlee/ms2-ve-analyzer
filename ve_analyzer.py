@@ -432,53 +432,66 @@ def cell_damping(mi: int, ri: int, history: list) -> float:
     return 0.5 if changes >= 1 else 1.0
 
 
-def _dwell_filter(samples: list, min_seconds: int = 2) -> list:
+def _dwell_filter(samples: list, min_seconds: int = 2) -> tuple[list, list]:
     """
     Filtra samples de una celda VE por permanencia mínima.
+
+    Retorna (stable_flat, stable_groups):
+      - stable_flat  : lista plana de todos los samples que pasaron el filtro
+      - stable_groups: lista de grupos, cada grupo es un dict con:
+          'samples'   : lista de samples del tramo
+          'secl_start': primer SecL del tramo
+          'secl_end'  : último SecL del tramo
+          'n_secs'    : segundos únicos del tramo
+          'n'         : cantidad de samples
 
     SecL en MegaSquirt es un entero en segundos (no sub-segundo): a 20 Hz hay
     ~20 muestras por segundo con el mismo SecL. Por eso el criterio usa
     segundos distintos, no cantidad de muestras.
 
-    Un grupo de samples pasa si abarca al menos min_seconds segundos distintos
-    y consecutivos (máximo salto de 1 s entre segundos adyacentes del grupo).
+    Un grupo pasa si abarca al menos min_seconds segundos distintos consecutivos
+    (máximo salto de 1 s entre segundos adyacentes del grupo).
 
-    Propósito: eliminar "drive-throughs" de un solo segundo — celdas que el
-    motor visita brevemente durante una aceleración desde ralentí (MAP sube a
-    65 kPa mientras el RPM aún no respondió, dura < 1 s). Un dwell real de
-    ≥ 2 s indica que el motor efectivamente operó en esa celda en estado
-    estacionario (tráfico urbano lento, carga parcial sostenida, etc.).
-
-    Si todos los SecL son 0 (log sin columna SecL), se omite el filtro.
+    Si todos los SecL son 0 (log sin columna SecL), se omite el filtro y se
+    devuelve un único grupo con todos los samples.
     """
     if not samples:
-        return samples
+        return [], []
     if max(s['secl'] for s in samples) == 0:
-        return samples   # sin timestamps reales → no filtrar
+        return samples, [{'samples': samples, 'secl_start': 0, 'secl_end': 0,
+                          'n_secs': 0, 'n': len(samples)}]
 
     s = sorted(samples, key=lambda x: (x['fi'], x['secl']))
 
     # Agrupar por archivo y segundos consecutivos (gap ≤ 1 s)
-    groups = []
-    group  = [s[0]]
+    raw_groups = []
+    group = [s[0]]
     for i in range(1, len(s)):
         same_file = s[i]['fi'] == s[i - 1]['fi']
         gap_ok    = s[i]['secl'] - s[i - 1]['secl'] <= 1
         if same_file and gap_ok:
             group.append(s[i])
         else:
-            groups.append(group)
+            raw_groups.append(group)
             group = [s[i]]
-    groups.append(group)
+    raw_groups.append(group)
 
-    stable = []
-    for g in groups:
+    stable_flat   = []
+    stable_groups = []
+    for g in raw_groups:
         secs = sorted({x['secl'] for x in g})
         if len(secs) < min_seconds:
-            continue   # menos de min_seconds segundos → drive-through de 1 s
-        stable.extend(g)
+            continue
+        stable_flat.extend(g)
+        stable_groups.append({
+            'samples':    g,
+            'secl_start': secs[0],
+            'secl_end':   secs[-1],
+            'n_secs':     len(secs),
+            'n':          len(g),
+        })
 
-    return stable
+    return stable_flat, stable_groups
 
 
 def analyze(rows: list, ve_data: dict, ae_cfg: dict,
@@ -522,7 +535,7 @@ def analyze(rows: list, ve_data: dict, ae_cfg: dict,
         req = zone_min_samples(m, min_samples)
 
         # Filtro de permanencia mínima: descartar "drive-throughs"
-        stable = _dwell_filter(raw_samples)
+        stable, stable_groups = _dwell_filter(raw_samples)
         afrs   = [s['afr'] for s in stable]
 
         if len(afrs) < req:
@@ -552,12 +565,33 @@ def analyze(rows: list, ve_data: dict, ae_cfg: dict,
         vn    = round(vc) + delta
 
         n_secs = len({s['secl'] for s in stable if s.get('secl', 0) > 0})
+
+        # Stats por grupo para vista detallada
+        def _grp_median(vals):
+            sv = sorted(vals)
+            mid = len(sv) // 2
+            return (sv[mid - 1] + sv[mid]) / 2 if len(sv) % 2 == 0 else sv[mid]
+
+        groups_detail = []
+        for g in stable_groups:
+            g_afrs = [s['afr'] for s in g['samples']]
+            groups_detail.append({
+                'secl_start': g['secl_start'],
+                'secl_end':   g['secl_end'],
+                'n_secs':     g['n_secs'],
+                'n':          g['n'],
+                'afr_med':    round(_grp_median(g_afrs), 2),
+                'afr_min':    round(min(g_afrs), 2),
+                'afr_max':    round(max(g_afrs), 2),
+            })
+
         entry = {
             'mi': mi, 'ri': ri, 'map': m, 'rpm': r,
             'afr_avg': avg, 'target': tgt, 'n': len(afrs), 'n_secs': n_secs,
             'n_raw': len(raw_samples),
             've_cur': vc, 've_new': vn, 'delta': delta,
             'damped': damp < 1.0,
+            'groups': groups_detail,
         }
 
         # Dead band: ignorar correcciones menores a 2 VE (ruido, no señal)
@@ -606,8 +640,29 @@ def analyze(rows: list, ve_data: dict, ae_cfg: dict,
 # 3. REPORTE
 # ─────────────────────────────────────────────
 
+def print_cell_detail(cell: dict) -> None:
+    """Imprime breakdown de tramos temporales para una celda."""
+    groups = cell.get('groups', [])
+    if not groups:
+        print("    (sin datos de tramos)")
+        return
+    print(f"    {'Tramo':>6}  {'SecL ini':>8}  {'SecL fin':>8}  {'dur(s)':>6}  "
+          f"{'n':>4}  {'AFR med':>7}  {'AFR min':>7}  {'AFR max':>7}")
+    print("    " + "-"*62)
+    for i, g in enumerate(groups, 1):
+        print(f"    {i:>6}  {g['secl_start']:>8}  {g['secl_end']:>8}  "
+              f"{g['n_secs']:>6}  {g['n']:>4}  "
+              f"{g['afr_med']:>7.2f}  {g['afr_min']:>7.2f}  {g['afr_max']:>7.2f}")
+    print(f"    {'─'*62}")
+    print(f"    {'GLOBAL':>6}  {'':>8}  {'':>8}  "
+          f"{cell['n_secs']:>6}  {cell['n']:>4}  "
+          f"{cell['afr_avg']:>7.2f}  {'':>7}  {'':>7}  "
+          f"target={cell['target']:.1f}  Δ={cell['delta']:+d}")
+    print()
+
+
 def print_report(result: dict, ae_cfg: dict, log_files: list, ve_data: dict,
-                 include_idle: bool = False):
+                 include_idle: bool = False, detail: bool = False):
     ae   = result['ae']
     lean = result['lean']
     rich = result['rich']
@@ -658,6 +713,8 @@ def print_report(result: dict, ae_cfg: dict, log_files: list, ve_data: dict,
             print(f"  {c['map']:>5.0f} {c['rpm']:>6} {c['afr_avg']:>7.2f} "
                   f"{c['target']:>7.1f} {_fmt_n(c):>9}  "
                   f"{c['ve_cur']:>6.0f} {c['ve_new']:>8} {c['delta']:>+4}")
+            if detail:
+                print_cell_detail(c)
         print()
 
     if rich:
@@ -667,6 +724,8 @@ def print_report(result: dict, ae_cfg: dict, log_files: list, ve_data: dict,
             print(f"  {c['map']:>5.0f} {c['rpm']:>6} {c['afr_avg']:>7.2f} "
                   f"{c['target']:>7.1f} {_fmt_n(c):>9}  "
                   f"{c['ve_cur']:>6.0f} {c['ve_new']:>8} {c['delta']:>+4}")
+            if detail:
+                print_cell_detail(c)
         print()
 
     if not lean and not rich:
@@ -2723,6 +2782,8 @@ def main():
                         help='Calibrar AE: analiza eventos de aceleración y sugiere nuevos taeBins/taeRates')
     parser.add_argument('--include-idle', action='store_true',
                         help='Incluir ralentí estable (TPS<3%%, CLT>70°C) en correcciones VE')
+    parser.add_argument('--detail', action='store_true',
+                        help='Mostrar tramos temporales individuales por celda corregida')
     args = parser.parse_args()
 
     project_dir = os.path.dirname(os.path.abspath(__file__))
@@ -2811,7 +2872,8 @@ def main():
                      history=history)
 
     # ── Reporte VE ──
-    print_report(result, ae_cfg, log_files, ve_data, include_idle=args.include_idle)
+    print_report(result, ae_cfg, log_files, ve_data, include_idle=args.include_idle,
+                 detail=args.detail)
 
     # ── Generar .table corregido o detectar convergencia ──
     n_sessions = len(history)

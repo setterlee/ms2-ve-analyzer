@@ -29,7 +29,7 @@ from ve_analyzer import (
     load_history_from_tables, check_effectiveness,
     analyze_health, _fmt_health_report,
     detect_ae_events, analyze_ae_calibration, print_ae_calibration,
-    print_report, print_effectiveness,
+    print_report, print_effectiveness, print_cell_detail,
 )
 
 
@@ -53,20 +53,35 @@ class _Redirect:
 
 def _cell_tree(parent) -> tuple:
     cols = ('map', 'rpm', 'afr', 'target', 'n', 've_cur', 've_new', 'delta')
-    hdrs = ('MAP', 'RPM', 'AFR', 'Target', 'n', 'VE act.', 'VE nuevo', 'Δ')
-    wids = (60, 70, 70, 70, 50, 70, 80, 50)
+    hdrs = ('MAP', 'RPM', 'AFR', 'Target', 'n(~s)', 'VE act.', 'VE nuevo', 'Δ')
+    wids = (60, 70, 70, 70, 70, 70, 80, 50)
 
-    frm  = ttk.Frame(parent)
-    tree = ttk.Treeview(frm, columns=cols, show='headings', height=20)
+    paned = ttk.PanedWindow(parent, orient=tk.VERTICAL)
+    paned.pack(fill=tk.BOTH, expand=True)
+
+    # ── Tree superior ──
+    tree_frm = ttk.Frame(paned)
+    paned.add(tree_frm, weight=2)
+
+    tree = ttk.Treeview(tree_frm, columns=cols, show='headings', height=12)
     for col, hdr, w in zip(cols, hdrs, wids):
         tree.heading(col, text=hdr)
         tree.column(col, width=w, anchor=tk.CENTER, minwidth=w)
-
-    vsb = ttk.Scrollbar(frm, orient=tk.VERTICAL, command=tree.yview)
+    vsb = ttk.Scrollbar(tree_frm, orient=tk.VERTICAL, command=tree.yview)
     tree.configure(yscrollcommand=vsb.set)
     tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
     vsb.pack(side=tk.RIGHT, fill=tk.Y)
-    return frm, tree
+
+    # ── Panel de detalle inferior ──
+    detail_frm = ttk.LabelFrame(paned, text="Tramos de la celda seleccionada")
+    paned.add(detail_frm, weight=1)
+
+    detail_txt = scrolledtext.ScrolledText(
+        detail_frm, state='disabled', wrap=tk.NONE,
+        font=('Courier', 9), height=8)
+    detail_txt.pack(fill=tk.BOTH, expand=True)
+
+    return paned, tree, detail_txt
 
 
 # ── Aplicación principal ─────────────────────────────────────────────────────
@@ -217,11 +232,22 @@ class VEAnalyzerApp:
             font=('Courier', 10))
         self._nb.add(self._txt_summary, text="Resumen")
 
-        self._lean_frm, self._lean_tree = _cell_tree(self._nb)
-        self._nb.add(self._lean_frm, text="Pobres")
+        self._lean_paned, self._lean_tree, self._lean_detail = _cell_tree(self._nb)
+        self._nb.add(self._lean_paned, text="Pobres")
 
-        self._rich_frm, self._rich_tree = _cell_tree(self._nb)
-        self._nb.add(self._rich_frm, text="Ricas")
+        self._rich_paned, self._rich_tree, self._rich_detail = _cell_tree(self._nb)
+        self._nb.add(self._rich_paned, text="Ricas")
+
+        self._lean_cell_map: dict = {}
+        self._rich_cell_map: dict = {}
+        self._lean_tree.bind('<<TreeviewSelect>>',
+                             lambda e: self._on_cell_select(self._lean_tree,
+                                                            self._lean_detail,
+                                                            self._lean_cell_map))
+        self._rich_tree.bind('<<TreeviewSelect>>',
+                             lambda e: self._on_cell_select(self._rich_tree,
+                                                            self._rich_detail,
+                                                            self._rich_cell_map))
 
         self._txt_health = scrolledtext.ScrolledText(
             self._nb, state='disabled', wrap=tk.WORD,
@@ -436,26 +462,51 @@ class VEAnalyzerApp:
 
         self._set_txt(self._txt_summary, "\n".join(lines))
 
+        def _fmt_n(c):
+            n, s = c['n'], c.get('n_secs', 0)
+            return f"{n}(~{s}s)" if s else str(n)
+
         self._lean_tree.delete(*self._lean_tree.get_children())
+        self._lean_cell_map.clear()
         for c in sorted(lean, key=lambda x: -x['delta']):
-            self._lean_tree.insert('', tk.END, values=(
+            iid = self._lean_tree.insert('', tk.END, values=(
                 f"{c['map']:.0f}", c['rpm'],
                 f"{c['afr_avg']:.2f}", f"{c['target']:.1f}",
-                c['n'], f"{c['ve_cur']:.0f}", c['ve_new'],
+                _fmt_n(c), f"{c['ve_cur']:.0f}", c['ve_new'],
                 f"{c['delta']:+d}"))
-        self._nb.tab(self._lean_frm, text=f"Pobres ({len(lean)})")
+            self._lean_cell_map[iid] = c
+        self._nb.tab(self._lean_paned, text=f"Pobres ({len(lean)})")
 
         self._rich_tree.delete(*self._rich_tree.get_children())
+        self._rich_cell_map.clear()
         for c in sorted(rich, key=lambda x: x['delta']):
-            self._rich_tree.insert('', tk.END, values=(
+            iid = self._rich_tree.insert('', tk.END, values=(
                 f"{c['map']:.0f}", c['rpm'],
                 f"{c['afr_avg']:.2f}", f"{c['target']:.1f}",
-                c['n'], f"{c['ve_cur']:.0f}", c['ve_new'],
+                _fmt_n(c), f"{c['ve_cur']:.0f}", c['ve_new'],
                 f"{c['delta']:+d}"))
-        self._nb.tab(self._rich_frm, text=f"Ricas ({len(rich)})")
+            self._rich_cell_map[iid] = c
+        self._nb.tab(self._rich_paned, text=f"Ricas ({len(rich)})")
 
         self._append_log("\n" + report_text)
         self._nb.select(0)
+
+    def _on_cell_select(self, tree, detail_txt, cell_map):
+        sel = tree.selection()
+        if not sel:
+            return
+        cell = cell_map.get(sel[0])
+        if not cell:
+            return
+        buf = io.StringIO()
+        old = __import__('sys').stdout
+        __import__('sys').stdout = buf
+        print_cell_detail(cell)
+        __import__('sys').stdout = old
+        detail_txt.configure(state='normal')
+        detail_txt.delete('1.0', tk.END)
+        detail_txt.insert(tk.END, buf.getvalue())
+        detail_txt.configure(state='disabled')
 
     # ── Generar tabla corregida ──────────────────────────────────────────────
 
