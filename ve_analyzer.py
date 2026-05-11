@@ -299,6 +299,7 @@ def load_msl_logs(log_files: list, include_idle: bool = False) -> list:
                     'rpmdot':   rpmdot,
                     'accel_pw': accel_pw,
                     'ego_cor':  row_raw.get('EGO cor1', 100.0),
+                    'afr_tgt':  row_raw.get('AFR Target 1'),
                     'secl':     row_raw.get('SecL', 0) or 0,
                     'file_idx': fi,
                 })
@@ -337,9 +338,10 @@ def load_msl_logs(log_files: list, include_idle: bool = False) -> list:
                     'tpsdot':   float(parts[cols['TPSdot']])   if 'TPSdot'    in cols else 0.0,
                     'mapdot':   float(parts[cols['MAPdot']])   if 'MAPdot'    in cols else 0.0,
                     'rpmdot':   float(parts[cols['RPMdot']])   if 'RPMdot'    in cols else 0.0,
-                    'accel_pw': float(parts[cols['Accel PW']]) if 'Accel PW'  in cols else 0.0,
-                    'ego_cor':  float(parts[cols['EGO cor1']]) if 'EGO cor1'  in cols else 100.0,
-                    'secl':     float(parts[cols['SecL']])     if 'SecL'      in cols else 0.0,
+                    'accel_pw': float(parts[cols['Accel PW']])      if 'Accel PW'     in cols else 0.0,
+                    'ego_cor':  float(parts[cols['EGO cor1']])      if 'EGO cor1'     in cols else 100.0,
+                    'afr_tgt':  float(parts[cols['AFR Target 1']])  if 'AFR Target 1' in cols else None,
+                    'secl':     float(parts[cols['SecL']])          if 'SecL'         in cols else 0.0,
                 }
             except (ValueError, IndexError):
                 continue
@@ -501,10 +503,11 @@ def analyze(rows: list, ve_data: dict, ae_cfg: dict,
         mi = find_bin(row['map'], map_bins)
         ri = find_bin(row['rpm'], rpm_bins)
         cell_samples.setdefault((mi, ri), []).append({
-            'afr':  row['afr'],
-            'rpm':  row['rpm'],
-            'fi':   row.get('file_idx', 0),
-            'secl': row.get('secl', 0) or 0,
+            'afr':     row['afr'],
+            'afr_tgt': row.get('afr_tgt'),
+            'rpm':     row['rpm'],
+            'fi':      row.get('file_idx', 0),
+            'secl':    row.get('secl', 0) or 0,
         })
 
     # Calcular correcciones
@@ -525,13 +528,28 @@ def analyze(rows: list, ve_data: dict, ae_cfg: dict,
         if len(afrs) < req:
             continue
 
-        avg   = sum(afrs) / len(afrs)
-        tgt   = target_afr(m)
+        # Mediana en vez de media — más robusta ante spikes de sonda lambda
+        afrs_sorted = sorted(afrs)
+        mid = len(afrs_sorted) // 2
+        avg = (afrs_sorted[mid - 1] + afrs_sorted[mid]) / 2 if len(afrs_sorted) % 2 == 0 \
+              else afrs_sorted[mid]
+
+        # AFR target: mediana de "AFR Target 1" del log; si no hay, función interna
+        tgt_vals = [s['afr_tgt'] for s in stable if s.get('afr_tgt') is not None]
+        if tgt_vals:
+            tgt_sorted = sorted(tgt_vals)
+            tmid = len(tgt_sorted) // 2
+            tgt = (tgt_sorted[tmid - 1] + tgt_sorted[tmid]) / 2 if len(tgt_sorted) % 2 == 0 \
+                  else tgt_sorted[tmid]
+        else:
+            tgt = target_afr(m)
         vc    = ve[mi][ri]
         raw_delta = vc * avg / tgt - vc
         damp  = cell_damping(mi, ri, history)
-        delta = round(raw_delta * damp)
-        vn    = int(vc) + delta
+        # Cap por sesión: máximo 10 VE units — evita picos por transitorios o pocas muestras
+        MAX_DELTA = 10
+        delta = max(-MAX_DELTA, min(MAX_DELTA, round(raw_delta * damp)))
+        vn    = round(vc) + delta
 
         entry = {
             'mi': mi, 'ri': ri, 'map': m, 'rpm': r,
@@ -832,6 +850,16 @@ def smooth_table(project_dir: str, table_num: int) -> None:
     # de las sesiones (mínimo 2 para evitar que una sola sesión ancle todo).
     anchor_threshold = max(2, n_sessions // 3)
 
+    # Celdas de la sesión más reciente → siempre ancladas.
+    # Evita que smooth deshaga correcciones recién aplicadas durante calibración activa.
+    last_session_cells: set = set()
+    if history:
+        for c in history[-1]['corrections']:
+            mi, ri = c['mi'], c['ri']
+            if 0 <= mi < n_rows and 0 <= ri < n_cols:
+                last_session_cells.add((mi, ri))
+                freq[mi][ri] = anchor_threshold  # forzar anclaje
+
     n_anchored  = sum(freq[mi][ri] >= anchor_threshold
                       for mi in range(n_rows) for ri in range(n_cols))
     n_blend     = sum(0 < freq[mi][ri] < anchor_threshold
@@ -845,6 +873,7 @@ def smooth_table(project_dir: str, table_num: int) -> None:
     print(f"  Sesiones en historial:      {n_sessions}")
     print(f"  Umbral de anclaje:          {anchor_threshold} sesiones")
     print(f"  Celdas ancladas (f≥{anchor_threshold}):    {n_anchored}/{n_total}")
+    print(f"  Celdas sesión reciente:     {len(last_session_cells)}/{n_total}  ← protegidas")
     print(f"  Celdas mezcla parcial:      {n_blend}/{n_total}")
     print(f"  Celdas sin historial (f=0): {n_zero}/{n_total}")
 
@@ -2773,7 +2802,8 @@ def main():
         sys.exit(1)
 
     # ── Análisis VE ──
-    result = analyze(rows, ve_data, ae_cfg, min_samples=args.min_samples, history=history)
+    result = analyze(rows, ve_data, ae_cfg, min_samples=args.min_samples,
+                     history=history)
 
     # ── Reporte VE ──
     print_report(result, ae_cfg, log_files, ve_data, include_idle=args.include_idle)
