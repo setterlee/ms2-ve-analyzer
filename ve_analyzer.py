@@ -39,6 +39,10 @@ _MLG_MAGIC      = b'MLVLG'
 _MLG_HDR_SIZE   = 24
 _MLG_CH_SIZE    = 89
 _MLG_REC_PREFIX = 5         # bytes de prefijo por record (flags/secuencia)
+
+# Segundos a descartar después de un transitorio (AE activo, MAPdot alto o TPSdot alto).
+# El wideband Bosch LSU 4.9 tarda 3-5 s en estabilizarse tras una aceleración rica.
+_WB_LAG_SECS = 4
 _MLG_TEMP_CH    = {'CLT', 'MAT'}   # almacenados en °F×10, MSL muestra °C
 
 # Columnas MLG → clave interna (para load_mlg_full / diagnóstico de salud)
@@ -258,6 +262,7 @@ def load_msl_logs(log_files: list, include_idle: bool = False) -> list:
             rec_size = _MLG_REC_PREFIX + sum(ch['size'] for ch in channels)
             n_rec    = (len(raw) - data_start) // rec_size
             print(f"  {os.path.basename(fname)}: {len(channels)} canales, {n_rec} records (MLG)")
+            last_transient_secl: float = -9999.0
             for row_raw in _mlg_iter_records(raw, channels, data_start):
                 rpm      = row_raw.get('RPM', 0)
                 afr      = row_raw.get('AFR', 0)
@@ -265,12 +270,18 @@ def load_msl_logs(log_files: list, include_idle: bool = False) -> list:
                 tps      = row_raw.get('TPS', 0)
                 accel_pw = row_raw.get('Accel PW', 0)
                 rpmdot   = row_raw.get('RPMdot', 0)
+                mapdot   = row_raw.get('MAPdot', 0)
+                tpsdot   = row_raw.get('TPSdot', 0)
                 mat      = row_raw.get('MAT')
+                secl     = row_raw.get('SecL', 0) or 0
+                # Rastrear transitorios en TODAS las filas (incluso las que se descartan)
+                # para que el cooldown cubra el lag del wideband tras el evento.
+                if accel_pw > 0.05 or abs(mapdot) > 40 or abs(tpsdot) > 30:
+                    last_transient_secl = secl
                 if rpm < 400 or not (8.0 < afr < 20.0) or clt < 70:
                     continue
                 if tps < 3.0:
                     if include_idle:
-                        mapdot = row_raw.get('MAPdot', 0)
                         if not (clt > 70 and 600 < rpm < 1200
                                 and accel_pw <= 0.05 and abs(mapdot) < 15):
                             continue
@@ -281,11 +292,12 @@ def load_msl_logs(log_files: list, include_idle: bool = False) -> list:
                         continue
                     if abs(rpmdot) > 400:
                         continue
-                    # Excluir transitorios de carga: MAP cambiando rápido = estado no estacionario
-                    mapdot = row_raw.get('MAPdot', 0)
                     if abs(mapdot) > 40:
                         continue
                 if mat is not None and not (38.0 <= mat <= 58.0):
+                    continue
+                # Cooldown post-transitorio: descartar hasta que el wideband se estabilice
+                if secl - last_transient_secl < _WB_LAG_SECS:
                     continue
                 all_rows.append({
                     'rpm':      rpm,
@@ -323,6 +335,7 @@ def load_msl_logs(log_files: list, include_idle: bool = False) -> list:
             print(f"  [!] Faltan columnas {missing} en {fname}, omitiendo.")
             continue
 
+        last_transient_secl: float = -9999.0
         for line in lines[2:]:
             parts = line.strip().split('\t')
             if len(parts) < 10:
@@ -345,6 +358,13 @@ def load_msl_logs(log_files: list, include_idle: bool = False) -> list:
                 }
             except (ValueError, IndexError):
                 continue
+
+            # Rastrear transitorios en TODAS las filas (incluso las que se descartan)
+            # para que el cooldown cubra el lag del wideband tras el evento.
+            if (row.get('accel_pw', 0) > 0.05
+                    or abs(row.get('mapdot', 0)) > 40
+                    or abs(row.get('tpsdot', 0)) > 30):
+                last_transient_secl = row['secl']
 
             # Filtros: motor encendido, AFR válido, motor caliente
             if row['rpm'] < 400 or not (8.0 < row['afr'] < 20.0) or row['clt'] < 70:
@@ -381,6 +401,9 @@ def load_msl_logs(log_files: list, include_idle: bool = False) -> list:
             # Filtro MAT: solo rango térmico estabilizado (evita oscilación por densidad)
             mat = row.get('mat')
             if mat is not None and not (38.0 <= mat <= 58.0):
+                continue
+            # Cooldown post-transitorio: descartar hasta que el wideband se estabilice
+            if row['secl'] - last_transient_secl < _WB_LAG_SECS:
                 continue
             row['file_idx'] = fi
             all_rows.append(row)
