@@ -207,6 +207,22 @@ def load_ve_table(msq_path: str, table_num: int = 1, project_dir: str = None) ->
             've_source': msq_path, 'bins_source': msq_path}
 
 
+def load_inj_config(msq_path: str) -> dict:
+    """Lee parámetros de inyección del .msq para calcular dead time por muestra."""
+    with open(msq_path, errors='replace') as f:
+        content = f.read()
+
+    def get_scalar(name):
+        m = re.search(rf'name="{name}"[^>]*>([\d.eE+-]+)</constant>', content)
+        return float(m.group(1)) if m else None
+
+    return {
+        'inj_open':  get_scalar('injOpen') or 1.0,
+        'batt_fac':  get_scalar('battFac') or 0.1,
+        'volt_ref':  13.2,   # TunerStudio etiqueta injOpen como "@ 13.2V"
+    }
+
+
 def load_ae_config(msq_path: str) -> dict:
     """Extrae configuración AE/TAE del CurrentTune.msq."""
     with open(msq_path, errors='replace') as f:
@@ -300,6 +316,8 @@ def load_msl_logs(log_files: list, include_idle: bool = False) -> list:
                     'ego_cor':  row_raw.get('EGO cor1', 100.0),
                     'afr_tgt':  row_raw.get('AFR Target 1'),
                     'secl':     row_raw.get('SecL', 0) or 0,
+                    'batt_v':   row_raw.get('Batt V'),
+                    'pw':       row_raw.get('PW'),
                     'file_idx': fi,
                 })
             continue   # no procesar como MSL
@@ -341,6 +359,8 @@ def load_msl_logs(log_files: list, include_idle: bool = False) -> list:
                     'ego_cor':  float(parts[cols['EGO cor1']])      if 'EGO cor1'     in cols else 100.0,
                     'afr_tgt':  float(parts[cols['AFR Target 1']])  if 'AFR Target 1' in cols else None,
                     'secl':     float(parts[cols['SecL']])          if 'SecL'         in cols else 0.0,
+                    'batt_v':   float(parts[cols['Batt V']])        if 'Batt V'       in cols else None,
+                    'pw':       float(parts[cols['PW']])            if 'PW'           in cols else None,
                 }
             except (ValueError, IndexError):
                 continue
@@ -494,13 +514,18 @@ def _dwell_filter(samples: list, min_seconds: int = 2) -> tuple[list, list]:
 
 
 def analyze(rows: list, ve_data: dict, ae_cfg: dict,
-            min_samples: int = 5, history: list = None) -> dict:
+            min_samples: int = 5, history: list = None,
+            inj_cfg: dict = None) -> dict:
     """Calcula AFR promedio por celda, separando muestras con/sin AE activo."""
     rpm_bins   = ve_data['rpm_bins']
     map_bins   = ve_data['map_bins']
     ve         = ve_data['ve']
     tps_thresh = ae_cfg.get('tpsThresh') or 20.0
     history    = history or []
+    inj_open   = (inj_cfg or {}).get('inj_open', 1.0)
+    batt_fac   = (inj_cfg or {}).get('batt_fac', 0.1)
+    volt_ref   = (inj_cfg or {}).get('volt_ref', 13.2)
+    MIN_EFF_PW = 0.5   # ms — por debajo de esto el inyector no entrega combustible controlable
 
     # Separar muestras
     ae_on  = [r for r in rows if r['accel_pw'] > 0.05]
@@ -520,6 +545,8 @@ def analyze(rows: list, ve_data: dict, ae_cfg: dict,
             'rpm':     row['rpm'],
             'fi':      row.get('file_idx', 0),
             'secl':    row.get('secl', 0) or 0,
+            'batt_v':  row.get('batt_v'),
+            'pw':      row.get('pw'),
         })
 
     # Calcular correcciones
@@ -539,6 +566,31 @@ def analyze(rows: list, ve_data: dict, ae_cfg: dict,
 
         if len(afrs) < req:
             continue
+
+        # Chequeo de piso de inyector: si el PW efectivo mediano es menor que
+        # MIN_EFF_PW el inyector no entrega combustible controlable y la lectura
+        # del wideband no refleja el VE de la celda.
+        eff_pws = []
+        for s in stable:
+            bv = s.get('batt_v')
+            pw = s.get('pw')
+            if bv is not None and pw is not None:
+                dt = inj_open + batt_fac * (volt_ref - bv)
+                eff_pws.append(pw - dt)
+        if eff_pws:
+            eff_pws_sorted = sorted(eff_pws)
+            ep_mid = len(eff_pws_sorted) // 2
+            eff_pw_med = (eff_pws_sorted[ep_mid - 1] + eff_pws_sorted[ep_mid]) / 2 \
+                         if len(eff_pws_sorted) % 2 == 0 else eff_pws_sorted[ep_mid]
+            if eff_pw_med < MIN_EFF_PW:
+                skipped.append({
+                    'mi': mi, 'ri': ri, 'map': m, 'rpm': r,
+                    'afr_avg': 0, 'target': 0, 'n': len(afrs), 'n_secs': 0,
+                    'n_raw': len(raw_samples), 've_cur': ve[mi][ri], 've_new': ve[mi][ri],
+                    'delta': 0, 'damped': False, 'groups': [],
+                    'skip_reason': f'piso inyector (eff_pw={eff_pw_med:.2f}ms)',
+                })
+                continue
 
         # Mediana en vez de media — más robusta ante spikes de sonda lambda
         afrs_sorted = sorted(afrs)
@@ -731,9 +783,17 @@ def print_report(result: dict, ae_cfg: dict, log_files: list, ve_data: dict,
         print("  ✓ Sin zonas fuera de objetivo. Mezcla dentro de rango.\n")
 
     skipped = result.get('skipped', [])
-    if skipped:
-        print(f"── IGNORADAS (dead band / amortiguadas) — {len(skipped)} celdas ──")
-        for c in sorted(skipped, key=lambda x: (x['map'], x['rpm'])):
+    floor_cells  = [c for c in skipped if c.get('skip_reason', '').startswith('piso')]
+    dband_cells  = [c for c in skipped if not c.get('skip_reason', '').startswith('piso')]
+    if floor_cells:
+        print(f"── PISO DE INYECTOR (sin corrección) — {len(floor_cells)} celdas ──")
+        for c in sorted(floor_cells, key=lambda x: (x['map'], x['rpm'])):
+            print(f"  MAP={c['map']:5.0f} RPM={c['rpm']:5d}  "
+                  f"VE={c['ve_cur']:.0f}  {c['skip_reason']}")
+        print()
+    if dband_cells:
+        print(f"── IGNORADAS (dead band / amortiguadas) — {len(dband_cells)} celdas ──")
+        for c in sorted(dband_cells, key=lambda x: (x['map'], x['rpm'])):
             damp_tag = ' [amortiguada]' if c.get('damped') else ''
             print(f"  MAP={c['map']:5.0f} RPM={c['rpm']:5d}  "
                   f"AFR={c['afr_avg']:.2f}  Δ={c['delta']:+d}{damp_tag}")
@@ -2854,8 +2914,9 @@ def main():
 
     # ── Cargar tabla VE y config AE desde MSQ ──
     print(f"\nCargando tabla VE (tabla {table_num}):")
-    ve_data = load_ve_table(msq_path, table_num)
-    ae_cfg  = load_ae_config(msq_path)
+    ve_data  = load_ve_table(msq_path, table_num)
+    ae_cfg   = load_ae_config(msq_path)
+    inj_cfg  = load_inj_config(msq_path)
 
     # ── Cargar historial desde .table files ──
     history = load_history_from_tables(table_dir, table_num)
@@ -2868,7 +2929,7 @@ def main():
 
     # ── Análisis VE ──
     result = analyze(rows, ve_data, ae_cfg, min_samples=args.min_samples,
-                     history=history)
+                     history=history, inj_cfg=inj_cfg)
 
     # ── Reporte VE ──
     print_report(result, ae_cfg, log_files, ve_data, include_idle=args.include_idle,

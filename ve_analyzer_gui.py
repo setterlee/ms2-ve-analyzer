@@ -23,7 +23,7 @@ else:
     sys.path.insert(0, str(_APP_DIR))
 
 from ve_analyzer import (
-    load_ve_table, load_ae_config,
+    load_ve_table, load_ae_config, load_inj_config,
     load_msl_logs, load_msl_full, load_mlg_full,
     analyze, generate_table, smooth_table, fuse_definitive_table,
     load_history_from_tables, check_effectiveness,
@@ -400,7 +400,8 @@ class VEAnalyzerApp:
             ve_data = load_ve_table(msq, table_num=tnum, project_dir=proj)
 
             print("Cargando configuración AE…")
-            ae_cfg = load_ae_config(msq)
+            ae_cfg  = load_ae_config(msq)
+            inj_cfg = load_inj_config(msq)
 
             print(f"Cargando {len(self._log_files)} log(s)…")
             rows = load_msl_logs(self._log_files, include_idle=idle)
@@ -411,7 +412,7 @@ class VEAnalyzerApp:
 
             print("Analizando…")
             result = analyze(rows, ve_data, ae_cfg,
-                             min_samples=min_s, history=history)
+                             min_samples=min_s, history=history, inj_cfg=inj_cfg)
             eff = check_effectiveness(result, history)
 
             # Capturar texto del reporte completo
