@@ -931,21 +931,16 @@ def load_history_from_tables(project_dir: str, table_num: int) -> list:
 
 def smooth_table(project_dir: str, table_num: int) -> None:
     """
-    Suaviza la tabla VE usando el historial completo de _corrected.table.
+    Suaviza la tabla VE usando interpolación Laplaciana.
 
-    Estrategia de confianza por frecuencia:
-    - Cuenta cuántas sesiones corrigieron cada celda → freq[mi][ri]
-    - Celdas con freq ≥ anchor_threshold: ANCLADAS (no cambian)
-    - Celdas con freq < anchor_threshold: mezcla ponderada hacia el promedio
-      de vecinos 3x3 (más blend cuanto menor la frecuencia)
-    - alpha (mezcla hacia vecinos) = 1 − freq / anchor_threshold
-      → freq=0: alpha=1.0 (100% vecinos)
-      → freq=1: alpha=0.67 (66% vecinos)
-      → freq≥threshold: alpha=0.0 (anclada)
-    - Se aplican PASSES pasadas para propagar suavizado a zonas adyacentes.
+    Las celdas corregidas al menos una vez son ANCLAS fijas (no cambian).
+    Las celdas sin corrección convergen iterativamente al promedio de sus
+    4 vecinos cardinales (arriba/abajo/izquierda/derecha) hasta que la
+    superficie converge. El resultado es la superficie más suave posible
+    que pasa exactamente por todos los valores calibrados.
     """
-    pattern  = os.path.join(project_dir, f'veTable{table_num}Tbl_*_corrected.table')
-    files    = sorted(glob.glob(pattern), key=os.path.getmtime)
+    pattern = os.path.join(project_dir, f'veTable{table_num}Tbl_*_corrected.table')
+    files   = sorted(glob.glob(pattern), key=os.path.getmtime)
 
     if not files:
         print("No se encontraron archivos _corrected.table en el directorio.")
@@ -958,165 +953,86 @@ def smooth_table(project_dir: str, table_num: int) -> None:
 
     n_cols = len(latest['rpm_bins'])
     n_rows = len(latest['map_bins'])
+    n_total = n_rows * n_cols
 
-    # ── Mapa de frecuencia de correcciones por celda ──
+    # ── Mapa de correcciones: cualquier celda corregida ≥1 vez es ancla ──
     history = load_history_from_tables(project_dir, table_num)
-    freq = [[0] * n_cols for _ in range(n_rows)]
+    corrected: set = set()
     for session in history:
         for c in session['corrections']:
             mi, ri = c['mi'], c['ri']
             if 0 <= mi < n_rows and 0 <= ri < n_cols:
-                freq[mi][ri] += 1
+                corrected.add((mi, ri))
 
-    n_sessions     = len(history)
-    # Una celda se considera "establecida" si fue corregida en al menos 1/3
-    # de las sesiones (mínimo 2 para evitar que una sola sesión ancle todo).
-    anchor_threshold = max(2, n_sessions // 3)
-
-    # Celdas de la sesión más reciente → siempre ancladas.
-    # Evita que smooth deshaga correcciones recién aplicadas durante calibración activa.
-    last_session_cells: set = set()
+    # Sesión reciente también protegida (aunque no tenga historial previo)
     if history:
         for c in history[-1]['corrections']:
             mi, ri = c['mi'], c['ri']
             if 0 <= mi < n_rows and 0 <= ri < n_cols:
-                last_session_cells.add((mi, ri))
-                freq[mi][ri] = anchor_threshold  # forzar anclaje
+                corrected.add((mi, ri))
 
-    n_anchored  = sum(freq[mi][ri] >= anchor_threshold
-                      for mi in range(n_rows) for ri in range(n_cols))
-    n_blend     = sum(0 < freq[mi][ri] < anchor_threshold
-                      for mi in range(n_rows) for ri in range(n_cols))
-    n_zero      = sum(freq[mi][ri] == 0
-                      for mi in range(n_rows) for ri in range(n_cols))
-    n_total     = n_rows * n_cols
+    n_anchored = len(corrected)
+    n_free     = n_total - n_anchored
 
-    print(f"\n── SUAVIZADO DE TABLA VE ─────────────────────────────")
-    print(f"  Base:                       {os.path.basename(files[-1])}")
-    print(f"  Sesiones en historial:      {n_sessions}")
-    print(f"  Umbral de anclaje:          {anchor_threshold} sesiones")
-    print(f"  Celdas ancladas (f≥{anchor_threshold}):    {n_anchored}/{n_total}")
-    print(f"  Celdas sesión reciente:     {len(last_session_cells)}/{n_total}  ← protegidas")
-    print(f"  Celdas mezcla parcial:      {n_blend}/{n_total}")
-    print(f"  Celdas sin historial (f=0): {n_zero}/{n_total}")
+    print(f"\n── SUAVIZADO DE TABLA VE (Laplaciano) ───────────────")
+    print(f"  Base:                 {os.path.basename(files[-1])}")
+    print(f"  Sesiones en historial:{len(history)}")
+    print(f"  Celdas ancla (≥1 corrección): {n_anchored}/{n_total}  ← intactas")
+    print(f"  Celdas libres (sin corrección): {n_free}/{n_total}  ← interpoladas")
 
-    # ── Reconstruir grid 2D de valores ──
+    # ── Grid inicial ──
     ve = [[latest['values'][mi * n_cols + ri] for ri in range(n_cols)]
           for mi in range(n_rows)]
+    orig = [row[:] for row in ve]
 
-    # ── Suavizado con mezcla ponderada por confianza + detección de outliers ──
-    # Una celda es outlier si su valor difiere del promedio de vecinos en más de
-    # OUTLIER_THRESHOLD puntos. Los outliers se suavizan agresivamente,
-    # pero SOLO si no están anclados (celdas calibradas protegen sus picos reales).
-    PASSES            = 2
-    OUTLIER_THRESHOLD = 15  # puntos VE de diferencia vs vecinos (radio amplio)
+    # ── Interpolación Laplaciana iterativa ──
+    # Cada celda libre = promedio de sus vecinos cardinales disponibles.
+    # Las anclas permanecen fijas. Itera hasta convergencia.
+    MAX_ITER = 1000
+    TOL      = 0.05  # puntos VE — convergencia suficiente para enteros
 
-    def neighbor_avg_weighted(mi, ri, grid, radius=1):
-        """Promedio ponderado por distancia inversa en radio NxN."""
-        total_w, total_v = 0.0, 0.0
-        for dmi in range(-radius, radius + 1):
-            for dri in range(-radius, radius + 1):
-                if dmi == 0 and dri == 0:
-                    continue
-                nmi, nri = mi + dmi, ri + dri
-                if 0 <= nmi < n_rows and 0 <= nri < n_cols:
-                    dist = (dmi ** 2 + dri ** 2) ** 0.5
-                    w = 1.0 / dist
-                    total_w += w
-                    total_v += grid[nmi][nri] * w
-        return (total_v / total_w) if total_w > 0 else None
-
-    # Detectar outliers con radio amplio (5x5) para capturar clusters elevados
-    # que se protegerían mutuamente en radio 3x3
-    outliers = set()
-    for mi in range(n_rows):
-        for ri in range(n_cols):
-            navg = neighbor_avg_weighted(mi, ri, ve, radius=2)
-            if navg is not None and abs(ve[mi][ri] - navg) > OUTLIER_THRESHOLD:
-                outliers.add((mi, ri))
-
-    if outliers:
-        print(f"\n  Celdas outlier detectadas (>{OUTLIER_THRESHOLD} pts vs vecinos): {len(outliers)}")
-        for mi, ri in sorted(outliers):
-            navg = neighbor_avg_weighted(mi, ri, ve, radius=2)
-            print(f"    MAP={latest['map_bins'][mi]:.0f} kPa  RPM={latest['rpm_bins'][ri]}"
-                  f"  VE={ve[mi][ri]:.1f}  vecinos_avg={navg:.1f}")
-
-    for _pass in range(PASSES):
+    for iteration in range(MAX_ITER):
+        max_change = 0.0
         ve_next = [row[:] for row in ve]
 
         for mi in range(n_rows):
             for ri in range(n_cols):
-                is_outlier = (mi, ri) in outliers
-                is_anchored = freq[mi][ri] >= anchor_threshold
-                # Celdas sin historial: alpha máx 0.5 (mezcla suave, no reemplazo)
-                raw_alpha = max(0.0, 1.0 - freq[mi][ri] / anchor_threshold)
-                alpha = min(raw_alpha, 0.5) if freq[mi][ri] == 0 else raw_alpha
+                if (mi, ri) in corrected:
+                    continue  # ancla — no tocar
 
-                # Outlier: forzar alpha alto, pero nunca sobre celdas ancladas.
-                # Un pico calibrado múltiples veces es señal real, no ruido.
-                if is_outlier and not is_anchored:
-                    alpha = max(alpha, 0.7)
-
-                if alpha == 0.0:
-                    continue  # anclada y no es outlier
-
-                navg = neighbor_avg_weighted(mi, ri, ve)
-                if navg is not None:
-                    blended = ve[mi][ri] * (1.0 - alpha) + navg * alpha
-                    ve_next[mi][ri] = round(blended, 1)
-
-        ve = ve_next
-
-    # ── Post-suavizado: restricción de gradiente cardinal ─────────────────
-    # Solo aplica a celdas NO ancladas. Las celdas calibradas múltiples veces
-    # pueden tener gradientes pronunciados reales (picos de torque, etc.)
-    # y no deben ser recortadas por este paso.
-    MAX_GRADIENT = 12.0  # puntos VE máximos entre adyacentes (solo no-ancladas)
-
-    grad_corrections: dict = {}   # (mi, ri) → (valor_original, valor_final)
-    for _iter in range(20):
-        any_change = False
-        for mi in range(n_rows):
-            for ri in range(n_cols):
-                if freq[mi][ri] >= anchor_threshold:
-                    continue  # celda anclada — respetar gradiente real
+                neighbors = []
                 for nmi, nri in [(mi - 1, ri), (mi + 1, ri),
                                  (mi, ri - 1), (mi, ri + 1)]:
-                    if not (0 <= nmi < n_rows and 0 <= nri < n_cols):
-                        continue
-                    diff = ve[mi][ri] - ve[nmi][nri]
-                    if diff > MAX_GRADIENT:
-                        if (mi, ri) not in grad_corrections:
-                            grad_corrections[(mi, ri)] = (ve[mi][ri], None)
-                        ve[mi][ri] = round(ve[nmi][nri] + MAX_GRADIENT, 1)
-                        grad_corrections[(mi, ri)] = (
-                            grad_corrections[(mi, ri)][0], ve[mi][ri])
-                        any_change = True
-        if not any_change:
+                    if 0 <= nmi < n_rows and 0 <= nri < n_cols:
+                        neighbors.append(ve[nmi][nri])
+
+                if neighbors:
+                    new_val = sum(neighbors) / len(neighbors)
+                    max_change = max(max_change, abs(new_val - ve[mi][ri]))
+                    ve_next[mi][ri] = new_val
+
+        ve = ve_next
+        if max_change < TOL:
+            print(f"  Convergió en {iteration + 1} iteraciones (cambio máx={max_change:.3f})")
             break
+    else:
+        print(f"  Alcanzó el límite de {MAX_ITER} iteraciones")
 
-    if grad_corrections:
-        print(f"\n  Restricción de gradiente (máx={MAX_GRADIENT:.0f} pts entre adyacentes):")
-        for (mi, ri), (v_old, v_new) in sorted(grad_corrections.items()):
-            print(f"    MAP={latest['map_bins'][mi]:.0f} kPa  "
-                  f"RPM={latest['rpm_bins'][ri]}  "
-                  f"{v_old:.1f} → {v_new:.1f}  "
-                  f"[freq={freq[mi][ri]}]")
+    # Redondear celdas libres a 1 decimal
+    for mi in range(n_rows):
+        for ri in range(n_cols):
+            if (mi, ri) not in corrected:
+                ve[mi][ri] = round(ve[mi][ri], 1)
 
-    # ── Calcular delta total aplicado ──
-    orig = [[latest['values'][mi * n_cols + ri] for ri in range(n_cols)]
-            for mi in range(n_rows)]
-    changed_cells = [(mi, ri, orig[mi][ri], ve[mi][ri])
-                     for mi in range(n_rows) for ri in range(n_cols)
-                     if abs(ve[mi][ri] - orig[mi][ri]) >= 0.5]
-
-    print(f"\n  Pasadas de suavizado:       {PASSES}")
-    print(f"  Celdas modificadas (≥0.5):  {len(changed_cells)}/{n_total}")
-    if changed_cells:
-        deltas = [abs(v_new - v_old) for _, _, v_old, v_new in changed_cells]
-        print(f"  Delta promedio:             {sum(deltas)/len(deltas):.1f}")
-        print(f"  Delta máximo:               {max(deltas):.1f}")
+    # ── Reporte de cambios ──
+    changed = [(mi, ri, orig[mi][ri], ve[mi][ri])
+               for mi in range(n_rows) for ri in range(n_cols)
+               if abs(ve[mi][ri] - orig[mi][ri]) >= 0.5]
+    print(f"  Celdas modificadas (≥0.5 pts): {len(changed)}/{n_total}")
+    if changed:
+        deltas = [abs(v_new - v_old) for _, _, v_old, v_new in changed]
+        print(f"  Delta promedio: {sum(deltas)/len(deltas):.1f}  "
+              f"Delta máximo: {max(deltas):.1f}")
 
     # ── Guardar _smoothed.table ──
     ts  = datetime.now().strftime('%Y-%m-%d_%H.%M')
