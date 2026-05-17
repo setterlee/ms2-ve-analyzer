@@ -805,12 +805,19 @@ def print_report(result: dict, ae_cfg: dict, log_files: list, ve_data: dict,
 # ─────────────────────────────────────────────
 
 def generate_table(result: dict, ve_data: dict, out_path: str):
-    """Aplica correcciones al VE y guarda un nuevo .table."""
+    """Aplica correcciones al VE y guarda un nuevo .table con metadatos de anclas."""
     import copy
     ve_new = copy.deepcopy(ve_data['ve'])
 
+    corrected_cells = []
     for c in result['lean'] + result['rich']:
         ve_new[c['mi']][c['ri']] = float(c['ve_new'])
+        corrected_cells.append((c['mi'], c['ri']))
+
+    # Incluir anclas heredadas de sesiones anteriores (acumulativo)
+    inherited = set(result.get('inherited_anchors', []))
+    all_anchors = inherited | set(corrected_cells)
+    anchors_str = ','.join(f"{mi}:{ri}" for mi, ri in sorted(all_anchors))
 
     rpm_bins = ve_data['rpm_bins']
     map_bins = ve_data['map_bins']
@@ -825,6 +832,7 @@ def generate_table(result: dict, ve_data: dict, out_path: str):
 <tableData xmlns="http://www.EFIAnalytics.com/:table">
 <bibliography author="EFI Analytics - philip.tobin@yahoo.com" company="EFI Analytics, copyright 2010, All Rights Reserved." writeDate="{now}"/>
 <versionInfo fileFormat="1.0"/>
+<anchors>{anchors_str}</anchors>
 <table cols="{ve_data['n_cols']}" rows="{ve_data['n_rows']}">
 <xAxis cols="{ve_data['n_cols']}" name="rpm">
 {chr(10).join("         " + str(r) + " " for r in rpm_bins)}
@@ -845,6 +853,7 @@ def generate_table(result: dict, ve_data: dict, out_path: str):
     print(f"  Tabla corregida guardada: {out_path}")
     print(f"  Celdas modificadas: {total} "
           f"({len(result['lean'])} pobres, {len(result['rich'])} ricas)")
+    print(f"  Anclas acumuladas embebidas: {len(all_anchors)} celdas")
 
 
 # ─────────────────────────────────────────────
@@ -852,7 +861,7 @@ def generate_table(result: dict, ve_data: dict, out_path: str):
 # ─────────────────────────────────────────────
 
 def _parse_table_file(path: str) -> dict | None:
-    """Lee bins y valores VE de un .table XML."""
+    """Lee bins, valores VE y anclas embebidas de un .table XML."""
     with open(path) as f:
         content = f.read()
     xa = re.search(r'<xAxis[^>]*>(.*?)</xAxis>', content, re.DOTALL)
@@ -863,7 +872,21 @@ def _parse_table_file(path: str) -> dict | None:
     rpm_bins = [int(float(x)) for x in re.findall(r'[\d.]+', xa.group(1))]
     map_bins = [float(x)      for x in re.findall(r'[\d.]+', ya.group(1))]
     values   = [float(x)      for x in re.findall(r'[\d.]+', za.group(1))]
-    return {'rpm_bins': rpm_bins, 'map_bins': map_bins, 'values': values}
+
+    # Leer anclas embebidas (generadas por generate_table a partir de v1.7.1)
+    anchors: set = set()
+    am = re.search(r'<anchors>(.*?)</anchors>', content)
+    if am and am.group(1).strip():
+        for token in am.group(1).strip().split(','):
+            parts = token.strip().split(':')
+            if len(parts) == 2:
+                try:
+                    anchors.add((int(parts[0]), int(parts[1])))
+                except ValueError:
+                    pass
+
+    return {'rpm_bins': rpm_bins, 'map_bins': map_bins,
+            'values': values, 'anchors': anchors}
 
 
 def _ts_from_filename(path: str) -> str:
@@ -929,15 +952,16 @@ def load_history_from_tables(project_dir: str, table_num: int) -> list:
     return sessions
 
 
-def smooth_table(project_dir: str, table_num: int) -> None:
+def smooth_table(project_dir: str, table_num: int,
+                 max_delta: float = 3.0, passes: int = 2) -> None:
     """
-    Suaviza la tabla VE usando interpolación Laplaciana.
+    Suaviza la tabla VE con límite de cambio máximo por celda.
 
-    Las celdas corregidas al menos una vez son ANCLAS fijas (no cambian).
-    Las celdas sin corrección convergen iterativamente al promedio de sus
-    4 vecinos cardinales (arriba/abajo/izquierda/derecha) hasta que la
-    superficie converge. El resultado es la superficie más suave posible
-    que pasa exactamente por todos los valores calibrados.
+    Todas las celdas se mueven suavemente hacia el promedio de sus 4 vecinos
+    cardinales, pero nunca más de max_delta puntos VE por pasada.
+    - Picos genuinos se preservan (solo ceden max_delta pts por paso)
+    - Ruido de celda única (1-3 pts) se corrige en 1-2 pasadas
+    - No necesita clasificar celdas en anclas vs libres
     """
     pattern = os.path.join(project_dir, f'veTable{table_num}Tbl_*_corrected.table')
     files   = sorted(glob.glob(pattern), key=os.path.getmtime)
@@ -951,78 +975,36 @@ def smooth_table(project_dir: str, table_num: int) -> None:
         print(f"Error leyendo {files[-1]}")
         return
 
-    n_cols = len(latest['rpm_bins'])
-    n_rows = len(latest['map_bins'])
+    n_cols  = len(latest['rpm_bins'])
+    n_rows  = len(latest['map_bins'])
     n_total = n_rows * n_cols
 
-    # ── Mapa de correcciones: cualquier celda corregida ≥1 vez es ancla ──
-    history = load_history_from_tables(project_dir, table_num)
-    corrected: set = set()
-    for session in history:
-        for c in session['corrections']:
-            mi, ri = c['mi'], c['ri']
-            if 0 <= mi < n_rows and 0 <= ri < n_cols:
-                corrected.add((mi, ri))
+    print(f"\n── SUAVIZADO DE TABLA VE ────────────────────────────")
+    print(f"  Base:          {os.path.basename(files[-1])}")
+    print(f"  Pasadas:       {passes}")
+    print(f"  Cambio máx:    ±{max_delta} pts VE por pasada")
 
-    # Sesión reciente también protegida (aunque no tenga historial previo)
-    if history:
-        for c in history[-1]['corrections']:
-            mi, ri = c['mi'], c['ri']
-            if 0 <= mi < n_rows and 0 <= ri < n_cols:
-                corrected.add((mi, ri))
-
-    n_anchored = len(corrected)
-    n_free     = n_total - n_anchored
-
-    print(f"\n── SUAVIZADO DE TABLA VE (Laplaciano) ───────────────")
-    print(f"  Base:                 {os.path.basename(files[-1])}")
-    print(f"  Sesiones en historial:{len(history)}")
-    print(f"  Celdas ancla (≥1 corrección): {n_anchored}/{n_total}  ← intactas")
-    print(f"  Celdas libres (sin corrección): {n_free}/{n_total}  ← interpoladas")
-
-    # ── Grid inicial ──
-    ve = [[latest['values'][mi * n_cols + ri] for ri in range(n_cols)]
-          for mi in range(n_rows)]
+    ve   = [[latest['values'][mi * n_cols + ri] for ri in range(n_cols)]
+            for mi in range(n_rows)]
     orig = [row[:] for row in ve]
 
-    # ── Interpolación Laplaciana iterativa ──
-    # Cada celda libre = promedio de sus vecinos cardinales disponibles.
-    # Las anclas permanecen fijas. Itera hasta convergencia.
-    MAX_ITER = 1000
-    TOL      = 0.05  # puntos VE — convergencia suficiente para enteros
-
-    for iteration in range(MAX_ITER):
-        max_change = 0.0
+    for _pass in range(passes):
         ve_next = [row[:] for row in ve]
-
         for mi in range(n_rows):
             for ri in range(n_cols):
-                if (mi, ri) in corrected:
-                    continue  # ancla — no tocar
-
                 neighbors = []
                 for nmi, nri in [(mi - 1, ri), (mi + 1, ri),
                                  (mi, ri - 1), (mi, ri + 1)]:
                     if 0 <= nmi < n_rows and 0 <= nri < n_cols:
                         neighbors.append(ve[nmi][nri])
-
-                if neighbors:
-                    new_val = sum(neighbors) / len(neighbors)
-                    max_change = max(max_change, abs(new_val - ve[mi][ri]))
-                    ve_next[mi][ri] = new_val
-
+                if not neighbors:
+                    continue
+                navg  = sum(neighbors) / len(neighbors)
+                delta = navg - ve[mi][ri]
+                # Mover hacia el promedio pero no más de max_delta
+                move  = max(-max_delta, min(max_delta, delta))
+                ve_next[mi][ri] = round(ve[mi][ri] + move, 1)
         ve = ve_next
-        if max_change < TOL:
-            print(f"  Convergió en {iteration + 1} iteraciones (cambio máx={max_change:.3f})")
-            break
-    else:
-        print(f"  Alcanzó el límite de {MAX_ITER} iteraciones")
-
-    # Redondear celdas libres a 1 decimal
-    for mi in range(n_rows):
-        for ri in range(n_cols):
-            if (mi, ri) not in corrected:
-                ve[mi][ri] = round(ve[mi][ri], 1)
 
     # ── Reporte de cambios ──
     changed = [(mi, ri, orig[mi][ri], ve[mi][ri])
