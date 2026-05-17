@@ -99,6 +99,7 @@ class VEAnalyzerApp:
 
         self._msq_path     = tk.StringVar()
         self._project_dir  = tk.StringVar()
+        self._table_dir    = tk.StringVar()
         self._table_num    = tk.IntVar(value=1)
         self._include_idle = tk.BooleanVar(value=False)
         self._min_samples  = tk.IntVar(value=5)
@@ -108,6 +109,7 @@ class VEAnalyzerApp:
             if candidate.exists():
                 self._msq_path.set(str(candidate))
                 self._project_dir.set(str(candidate.parent))
+                self._table_dir.set(str(candidate.parent / 've-calibration-process'))
                 break
 
         self._build_ui()
@@ -173,6 +175,13 @@ class VEAnalyzerApp:
             row=6, column=0, sticky=tk.EW)
         ttk.Button(f, text="…", width=3,
                    command=self._browse_dir).grid(row=6, column=1, padx=(2, 0))
+
+        ttk.Label(f, text="Carpeta de tablas (.table)").grid(
+            row=7, column=0, sticky=tk.W, pady=(8, 0))
+        ttk.Entry(f, textvariable=self._table_dir, width=27).grid(
+            row=8, column=0, sticky=tk.EW)
+        ttk.Button(f, text="…", width=3,
+                   command=self._browse_table_dir).grid(row=8, column=1, padx=(2, 0))
 
         # ── Opciones ────────────────────────────────────────────────────────
         o = ttk.LabelFrame(parent, text="Opciones", padding=8)
@@ -272,7 +281,9 @@ class VEAnalyzerApp:
             filetypes=[("MSQ", "*.msq"), ("Todos", "*.*")])
         if p:
             self._msq_path.set(p)
-            self._project_dir.set(str(Path(p).parent))
+            parent = Path(p).parent
+            self._project_dir.set(str(parent))
+            self._table_dir.set(str(parent / 've-calibration-process'))
 
     def _browse_logs(self):
         ps = filedialog.askopenfilenames(
@@ -295,6 +306,12 @@ class VEAnalyzerApp:
         p = filedialog.askdirectory(title="Seleccionar directorio del proyecto")
         if p:
             self._project_dir.set(p)
+            self._table_dir.set(str(Path(p) / 've-calibration-process'))
+
+    def _browse_table_dir(self):
+        p = filedialog.askdirectory(title="Seleccionar carpeta de tablas .table")
+        if p:
+            self._table_dir.set(p)
 
     def _auto_find_logs(self):
         msq = self._msq_path.get()
@@ -599,15 +616,21 @@ class VEAnalyzerApp:
     # ── Suavizar tabla ───────────────────────────────────────────────────────
 
     def _smooth(self):
-        proj = self._project_dir.get()
-        if not proj:
-            messagebox.showerror("Error", "Selecciona el directorio del proyecto.")
+        table_dir = self._table_dir.get()
+        if not table_dir:
+            messagebox.showerror("Error", "Indica la carpeta de tablas .table.")
+            return
+        if not Path(table_dir).is_dir():
+            messagebox.showerror(
+                "Error",
+                f"No existe la carpeta:\n{table_dir}\n\n"
+                "Verifica la ruta en 'Carpeta de tablas'.")
             return
         self._lock(True)
         self._status.set("Suavizando tabla VE…")
 
         def _do():
-            smooth_table(proj, self._table_num.get())
+            smooth_table(table_dir, self._table_num.get())
 
         self._run_in_thread(_do, lambda: (
             self._lock(False),
@@ -622,12 +645,12 @@ class VEAnalyzerApp:
         if not proj:
             messagebox.showerror("Error", "Selecciona el directorio del proyecto.")
             return
-        table_dir = str(Path(proj) / 've-calibration-process')
-        if not Path(table_dir).is_dir():
+        table_dir = self._table_dir.get()
+        if not table_dir or not Path(table_dir).is_dir():
             messagebox.showerror(
                 "Error",
-                f"No existe directorio:\n{table_dir}\n\n"
-                "Primero genera al menos 2 tablas _corrected con 'Generar tabla corregida'.")
+                f"No existe la carpeta:\n{table_dir or '(vacía)'}\n\n"
+                "Verifica la ruta en 'Carpeta de tablas'.")
             return
         self._lock(True)
         self._status.set("Generando tabla definitiva…")
