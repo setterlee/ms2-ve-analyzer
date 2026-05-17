@@ -26,6 +26,7 @@ from ve_analyzer import (
     load_ve_table, load_ae_config, load_inj_config,
     load_msl_logs, load_msl_full, load_mlg_full,
     analyze, generate_table, smooth_table, fuse_definitive_table,
+    predict_uncovered_cells,
     load_history_from_tables, check_effectiveness,
     analyze_health, _fmt_health_report,
     detect_ae_events, analyze_ae_calibration, print_ae_calibration,
@@ -228,6 +229,10 @@ class VEAnalyzerApp:
                                       command=self._smooth)
         self._btn_smooth.pack(fill=tk.X, pady=2)
 
+        self._btn_predict = ttk.Button(a, text="Predecir celdas sin cobertura",
+                                       command=self._predict)
+        self._btn_predict.pack(fill=tk.X, pady=2)
+
         self._btn_fuse = ttk.Button(a, text="Tabla definitiva",
                                     command=self._fuse_definitive)
         self._btn_fuse.pack(fill=tk.X, pady=2)
@@ -362,7 +367,7 @@ class VEAnalyzerApp:
     def _lock(self, locked: bool):
         state = tk.DISABLED if locked else tk.NORMAL
         for b in (self._btn_analyze, self._btn_health,
-                  self._btn_ae, self._btn_smooth, self._btn_fuse):
+                  self._btn_ae, self._btn_smooth, self._btn_predict, self._btn_fuse):
             b.configure(state=state)
         if locked:
             self._btn_gen.configure(state=tk.DISABLED)
@@ -635,6 +640,37 @@ class VEAnalyzerApp:
         self._run_in_thread(_do, lambda: (
             self._lock(False),
             self._status.set("Tabla suavizada. Archivo _smoothed.table guardado."),
+            self._nb.select(self._txt_log)
+        ))
+
+    # ── Predicción de celdas sin cobertura ──────────────────────────────────
+
+    def _predict(self):
+        table_dir = self._table_dir.get()
+        if not table_dir:
+            messagebox.showerror("Error", "Indica la carpeta de tablas .table.")
+            return
+        if not Path(table_dir).is_dir():
+            messagebox.showerror("Error",
+                                 f"No existe la carpeta:\n{table_dir}\n\n"
+                                 "Verifica la ruta en 'Carpeta de tablas'.")
+            return
+        if not (Path(table_dir) / 'zero.table').exists():
+            messagebox.showerror("Error",
+                                 f"No se encontró zero.table en:\n{table_dir}\n\n"
+                                 "Copia tu tabla de partida como 'zero.table' "
+                                 "en esa carpeta.")
+            return
+        self._lock(True)
+        self._status.set("Prediciendo celdas sin cobertura…")
+        self._set_txt(self._txt_log, "")
+
+        def _do():
+            predict_uncovered_cells(table_dir, self._table_num.get())
+
+        self._run_in_thread(_do, lambda: (
+            self._lock(False),
+            self._status.set("Predicción completada. Archivo _predicted.table guardado."),
             self._nb.select(self._txt_log)
         ))
 

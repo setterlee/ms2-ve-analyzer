@@ -1052,6 +1052,198 @@ def smooth_table(project_dir: str, table_num: int,
     print(f"\n  Tabla suavizada guardada: {os.path.basename(out)}")
 
 
+def predict_uncovered_cells(project_dir: str, table_num: int) -> None:
+    """
+    Predice VE para celdas sin cobertura de logs usando el patrón de
+    correcciones observado en las celdas con datos.
+
+    Estrategia:
+    1. Carga zero.table (punto de partida antes de cualquier corrección)
+    2. Carga el último _corrected.table (estado calibrado actual)
+    3. Identifica celdas calibradas (con datos de log) via historial
+    4. Calcula delta[mi][ri] = current - zero  para celdas calibradas
+    5. Interpola la superficie de deltas a las celdas sin datos (Laplaciano)
+    6. predicted[mi][ri] = zero[mi][ri] + delta_interpolado[mi][ri]
+    7. Las celdas calibradas quedan intactas; solo se tocan las sin datos
+    """
+    # ── Archivos ──
+    zero_path = os.path.join(project_dir, 'zero.table')
+    if not os.path.exists(zero_path):
+        print("  ERROR: no se encontró zero.table en el directorio.")
+        print("  Copia tu tabla de partida como 'zero.table' en la carpeta de tablas.")
+        return
+
+    pattern = os.path.join(project_dir, f'veTable{table_num}Tbl_*_corrected.table')
+    files   = sorted(glob.glob(pattern), key=os.path.getmtime)
+    if not files:
+        print("  No se encontraron archivos _corrected.table.")
+        return
+
+    zero    = _parse_table_file(zero_path)
+    current = _parse_table_file(files[-1])
+    if not zero or not current:
+        print("  Error leyendo tablas.")
+        return
+
+    n_cols = len(current['rpm_bins'])
+    n_rows = len(current['map_bins'])
+
+    if len(zero['values']) != len(current['values']):
+        print("  zero.table y el _corrected.table tienen dimensiones distintas.")
+        return
+
+    # ── Celdas calibradas (anclas del delta) ──
+    # Fuente 1: anclas embebidas en los _corrected.table
+    calibrated: set = set()
+    for path in files:
+        parsed = _parse_table_file(path)
+        if parsed and parsed.get('anchors'):
+            calibrated |= parsed['anchors']
+    # Fuente 2: fallback a diffs consecutivos
+    if not calibrated:
+        history = load_history_from_tables(project_dir, table_num)
+        freq = {}
+        for s in history:
+            for c in s['corrections']:
+                k = (c['mi'], c['ri'])
+                freq[k] = freq.get(k, 0) + 1
+                calibrated.add(k)
+    else:
+        history = load_history_from_tables(project_dir, table_num)
+        freq = {}
+        for s in history:
+            for c in s['corrections']:
+                k = (c['mi'], c['ri'])
+                freq[k] = freq.get(k, 0) + 1
+
+    calibrated = {(mi, ri) for mi, ri in calibrated
+                  if 0 <= mi < n_rows and 0 <= ri < n_cols}
+    uncovered  = {(mi, ri)
+                  for mi in range(n_rows) for ri in range(n_cols)
+                  if (mi, ri) not in calibrated}
+
+    print(f"\n── PREDICCIÓN DE CELDAS SIN COBERTURA ──────────────")
+    print(f"  Base zero:     {os.path.basename(zero_path)}")
+    print(f"  Estado actual: {os.path.basename(files[-1])}")
+    print(f"  Celdas con datos (anclas): {len(calibrated)}/256")
+    print(f"  Celdas a predecir:         {len(uncovered)}/256")
+
+    if not calibrated:
+        print("\n  No hay celdas calibradas. Toma logs primero.")
+        return
+
+    # ── Grid de deltas ──
+    # Para celdas calibradas: delta real (ancla fija)
+    # Para celdas sin datos: inicializar a 0, luego Laplaciano
+    delta = [[current['values'][mi * n_cols + ri] - zero['values'][mi * n_cols + ri]
+              for ri in range(n_cols)]
+             for mi in range(n_rows)]
+
+    # Resetear deltas de celdas no calibradas a 0 (serán interpoladas)
+    for mi in range(n_rows):
+        for ri in range(n_cols):
+            if (mi, ri) not in calibrated:
+                delta[mi][ri] = 0.0
+
+    # ── Interpolación Laplaciana sobre superficie de deltas ──
+    MAX_ITER = 2000
+    TOL      = 0.02
+    for iteration in range(MAX_ITER):
+        max_change = 0.0
+        delta_next = [row[:] for row in delta]
+        for mi in range(n_rows):
+            for ri in range(n_cols):
+                if (mi, ri) in calibrated:
+                    continue  # ancla — delta conocido, no tocar
+                neighbors = []
+                for nmi, nri in [(mi-1, ri), (mi+1, ri),
+                                 (mi, ri-1), (mi, ri+1)]:
+                    if 0 <= nmi < n_rows and 0 <= nri < n_cols:
+                        neighbors.append(delta[nmi][nri])
+                if neighbors:
+                    new_val    = sum(neighbors) / len(neighbors)
+                    max_change = max(max_change, abs(new_val - delta[mi][ri]))
+                    delta_next[mi][ri] = new_val
+        delta = delta_next
+        if max_change < TOL:
+            break
+
+    # ── Construir tabla predicha ──
+    # Calibradas: mantener current  |  No calibradas: zero + delta_interpolado
+    ve_zero    = [[zero['values'][mi * n_cols + ri]    for ri in range(n_cols)]
+                  for mi in range(n_rows)]
+    ve_current = [[current['values'][mi * n_cols + ri] for ri in range(n_cols)]
+                  for mi in range(n_rows)]
+
+    ve_pred = [[0.0] * n_cols for _ in range(n_rows)]
+    for mi in range(n_rows):
+        for ri in range(n_cols):
+            if (mi, ri) in calibrated:
+                ve_pred[mi][ri] = ve_current[mi][ri]
+            else:
+                raw = ve_zero[mi][ri] + delta[mi][ri]
+                ve_pred[mi][ri] = round(max(1.0, min(150.0, raw)), 1)
+
+    # ── Calcular distancia mínima a celda calibrada (confianza) ──
+    def min_dist(mi, ri):
+        return min(((mi - cmi)**2 + (ri - cri)**2) ** 0.5
+                   for cmi, cri in calibrated)
+
+    # ── Reporte de celdas predichas ──
+    predicted_cells = sorted(uncovered, key=lambda k: (k[0], k[1]))
+    print(f"\n  {'MAP':>5}  {'RPM':>6}  {'zero':>5}  {'Δ_pred':>7}  {'pred':>5}  {'conf':>6}")
+    print(f"  {'---':>5}  {'---':>6}  {'----':>5}  {'------':>7}  {'----':>5}  {'----':>6}")
+    for mi, ri in predicted_cells:
+        z   = ve_zero[mi][ri]
+        d   = delta[mi][ri]
+        p   = ve_pred[mi][ri]
+        dist = min_dist(mi, ri)
+        conf = "alta" if dist <= 1.5 else ("media" if dist <= 2.5 else "baja")
+        print(f"  {current['map_bins'][mi]:>5.0f}  {current['rpm_bins'][ri]:>6}  "
+              f"{z:>5.1f}  {d:>+7.1f}  {p:>5.1f}  {conf:>6}")
+
+    # Resumen por confianza
+    alta  = sum(1 for mi, ri in uncovered if min_dist(mi, ri) <= 1.5)
+    media = sum(1 for mi, ri in uncovered if 1.5 < min_dist(mi, ri) <= 2.5)
+    baja  = sum(1 for mi, ri in uncovered if min_dist(mi, ri) > 2.5)
+    print(f"\n  Confianza alta  (dist ≤1.5 celdas): {alta}")
+    print(f"  Confianza media (dist ≤2.5 celdas): {media}")
+    print(f"  Confianza baja  (dist >2.5 celdas): {baja}")
+
+    # ── Guardar _predicted.table ──
+    ts  = datetime.now().strftime('%Y-%m-%d_%H.%M')
+    out = os.path.join(project_dir, f'veTable{table_num}Tbl_{ts}_predicted.table')
+    z_rows  = "\n".join(
+        "         " + " ".join(f"{v:.1f}" for v in row) + " "
+        for row in ve_pred)
+    now_str = datetime.now().strftime("%a %b %d %H:%M:%S CLST %Y")
+    xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="no"?>\n'
+        '<tableData xmlns="http://www.EFIAnalytics.com/:table">\n'
+        f'<bibliography author="EFI Analytics - philip.tobin@yahoo.com"'
+        f' company="EFI Analytics, copyright 2010, All Rights Reserved."'
+        f' writeDate="{now_str}"/>\n'
+        '<versionInfo fileFormat="1.0"/>\n'
+        f'<table cols="{n_cols}" rows="{n_rows}">\n'
+        f'<xAxis cols="{n_cols}" name="rpm">\n'
+        + "\n".join(f"         {r} " for r in current['rpm_bins']) + "\n"
+        '      </xAxis>\n'
+        f'<yAxis name="fuelload" rows="{n_rows}">\n'
+        + "\n".join(f"         {m} " for m in current['map_bins']) + "\n"
+        '      </yAxis>\n'
+        f'<zValues cols="{n_cols}" rows="{n_rows}">\n'
+        f'{z_rows}\n'
+        '      </zValues>\n'
+        '</table>\n'
+        '</tableData>\n'
+    )
+    with open(out, 'w') as f:
+        f.write(xml)
+    print(f"\n  Tabla predicha guardada: {os.path.basename(out)}")
+    print(f"  Importala en TunerStudio, toma logs en las zonas predichas")
+    print(f"  y confirma con el análisis VE normal.")
+
+
 def fuse_definitive_table(project_dir: str, table_num: int = 3,
                           base_percentile: float = 0.50,
                           near_radius: int = 4,
@@ -2733,6 +2925,9 @@ def main():
                         help='Solo mostrar diagnóstico de salud, sin análisis VE')
     parser.add_argument('--smooth', action='store_true',
                         help='Suavizar tabla VE usando historial de _corrected.table')
+    parser.add_argument('--predict', action='store_true',
+                        help='Predecir VE para celdas sin cobertura usando zero.table '
+                             'y el patrón de correcciones observado')
     parser.add_argument('--fuse-definitive', action='store_true',
                         help='Fusionar todas las _corrected.table en una tabla definitiva '
                              'con proyección matemática del lean global a celdas sin datos')
@@ -2757,6 +2952,11 @@ def main():
     # ── Suavizado de tabla (no requiere logs) ──
     if args.smooth:
         smooth_table(table_dir, table_num)
+        return
+
+    # ── Predicción de celdas sin cobertura (no requiere logs) ──
+    if args.predict:
+        predict_uncovered_cells(table_dir, table_num)
         return
 
     # ── Fusión definitiva (no requiere logs) ──
