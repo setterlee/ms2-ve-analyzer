@@ -1006,10 +1006,10 @@ def smooth_table(project_dir: str, table_num: int) -> None:
 
     # ── Suavizado con mezcla ponderada por confianza + detección de outliers ──
     # Una celda es outlier si su valor difiere del promedio de vecinos en más de
-    # OUTLIER_THRESHOLD puntos. Los outliers se suavizan agresivamente
-    # independientemente de su frecuencia de corrección.
-    PASSES            = 5
-    OUTLIER_THRESHOLD = 8   # puntos VE de diferencia vs vecinos (radio amplio)
+    # OUTLIER_THRESHOLD puntos. Los outliers se suavizan agresivamente,
+    # pero SOLO si no están anclados (celdas calibradas protegen sus picos reales).
+    PASSES            = 2
+    OUTLIER_THRESHOLD = 15  # puntos VE de diferencia vs vecinos (radio amplio)
 
     def neighbor_avg_weighted(mi, ri, grid, radius=1):
         """Promedio ponderado por distancia inversa en radio NxN."""
@@ -1048,10 +1048,14 @@ def smooth_table(project_dir: str, table_num: int) -> None:
         for mi in range(n_rows):
             for ri in range(n_cols):
                 is_outlier = (mi, ri) in outliers
-                alpha = max(0.0, 1.0 - freq[mi][ri] / anchor_threshold)
+                is_anchored = freq[mi][ri] >= anchor_threshold
+                # Celdas sin historial: alpha máx 0.5 (mezcla suave, no reemplazo)
+                raw_alpha = max(0.0, 1.0 - freq[mi][ri] / anchor_threshold)
+                alpha = min(raw_alpha, 0.5) if freq[mi][ri] == 0 else raw_alpha
 
-                # Outlier: forzar alpha alto para que converja hacia vecinos
-                if is_outlier:
+                # Outlier: forzar alpha alto, pero nunca sobre celdas ancladas.
+                # Un pico calibrado múltiples veces es señal real, no ruido.
+                if is_outlier and not is_anchored:
                     alpha = max(alpha, 0.7)
 
                 if alpha == 0.0:
@@ -1065,18 +1069,18 @@ def smooth_table(project_dir: str, table_num: int) -> None:
         ve = ve_next
 
     # ── Post-suavizado: restricción de gradiente cardinal ─────────────────
-    # Celdas ancladas con alta frecuencia pueden crear picos físicamente
-    # irreales que el suavizado no toca. Este paso los corrige igualmente:
-    # si cualquier par de celdas adyacentes (↑↓←→) difiere más de
-    # MAX_GRADIENT, la celda más alta se baja hasta (vecino + MAX_GRADIENT).
-    # Se itera hasta convergencia (máx 20 vueltas).
-    MAX_GRADIENT = 8.0   # puntos VE máximos permitidos entre celdas adyacentes
+    # Solo aplica a celdas NO ancladas. Las celdas calibradas múltiples veces
+    # pueden tener gradientes pronunciados reales (picos de torque, etc.)
+    # y no deben ser recortadas por este paso.
+    MAX_GRADIENT = 12.0  # puntos VE máximos entre adyacentes (solo no-ancladas)
 
     grad_corrections: dict = {}   # (mi, ri) → (valor_original, valor_final)
     for _iter in range(20):
         any_change = False
         for mi in range(n_rows):
             for ri in range(n_cols):
+                if freq[mi][ri] >= anchor_threshold:
+                    continue  # celda anclada — respetar gradiente real
                 for nmi, nri in [(mi - 1, ri), (mi + 1, ri),
                                  (mi, ri - 1), (mi, ri + 1)]:
                     if not (0 <= nmi < n_rows and 0 <= nri < n_cols):
