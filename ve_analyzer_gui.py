@@ -22,6 +22,21 @@ else:
     _APP_DIR = Path(__file__).parent
     sys.path.insert(0, str(_APP_DIR))
 
+
+def _get_version() -> str:
+    try:
+        import subprocess
+        r = subprocess.run(
+            ['git', 'describe', '--tags', '--abbrev=0'],
+            capture_output=True, text=True, cwd=str(_APP_DIR))
+        if r.returncode == 0:
+            return r.stdout.strip().lstrip('v')
+    except Exception:
+        pass
+    return "dev"
+
+__version__ = _get_version()
+
 from ve_analyzer import (
     load_ve_table, load_ae_config, load_inj_config,
     load_msl_logs, load_msl_full, load_mlg_full,
@@ -90,7 +105,7 @@ def _cell_tree(parent) -> tuple:
 class VEAnalyzerApp:
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title("VE Analyzer — MegaSquirt MS2")
+        self.root.title(f"VE Analyzer — MegaSquirt MS2  v{__version__}")
         self.root.minsize(1020, 660)
 
         self._result    = None
@@ -137,8 +152,36 @@ class VEAnalyzerApp:
                   padding=(4, 2)).pack(fill=tk.X, side=tk.BOTTOM, padx=6, pady=(0, 6))
 
     def _build_left(self, parent):
+        # ── Panel scrollable ─────────────────────────────────────────────────
+        _canvas = tk.Canvas(parent, highlightthickness=0)
+        _vsb = ttk.Scrollbar(parent, orient=tk.VERTICAL, command=_canvas.yview)
+        _canvas.configure(yscrollcommand=_vsb.set)
+
+        _inner = ttk.Frame(_canvas)
+        _win_id = _canvas.create_window((0, 0), window=_inner, anchor='nw')
+
+        def _on_inner_configure(e):
+            _canvas.configure(scrollregion=_canvas.bbox('all'))
+
+        def _on_canvas_configure(e):
+            _canvas.itemconfig(_win_id, width=e.width)
+
+        def _on_mousewheel(e):
+            delta = e.delta
+            if sys.platform != 'darwin':
+                delta = delta // 120
+            _canvas.yview_scroll(-delta, 'units')
+
+        _inner.bind('<Configure>', _on_inner_configure)
+        _canvas.bind('<Configure>', _on_canvas_configure)
+        _canvas.bind('<Enter>', lambda e: _canvas.bind_all('<MouseWheel>', _on_mousewheel))
+        _canvas.bind('<Leave>', lambda e: _canvas.unbind_all('<MouseWheel>'))
+
+        _vsb.pack(side=tk.RIGHT, fill=tk.Y)
+        _canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
         # ── Archivos ────────────────────────────────────────────────────────
-        f = ttk.LabelFrame(parent, text="Archivos", padding=8)
+        f = ttk.LabelFrame(_inner, text="Archivos", padding=8)
         f.pack(fill=tk.X, padx=5, pady=5)
         f.columnconfigure(0, weight=1)
 
@@ -185,7 +228,7 @@ class VEAnalyzerApp:
                    command=self._browse_table_dir).grid(row=8, column=1, padx=(2, 0))
 
         # ── Opciones ────────────────────────────────────────────────────────
-        o = ttk.LabelFrame(parent, text="Opciones", padding=8)
+        o = ttk.LabelFrame(_inner, text="Opciones", padding=8)
         o.pack(fill=tk.X, padx=5, pady=5)
 
         ttk.Label(o, text="Tabla VE:").grid(row=0, column=0, sticky=tk.W)
@@ -202,7 +245,7 @@ class VEAnalyzerApp:
                     from_=1, to=50, width=5).grid(row=2, column=1, sticky=tk.W)
 
         # ── Acciones ────────────────────────────────────────────────────────
-        a = ttk.LabelFrame(parent, text="Acciones", padding=8)
+        a = ttk.LabelFrame(_inner, text="Acciones", padding=8)
         a.pack(fill=tk.X, padx=5, pady=5)
 
         self._btn_analyze = ttk.Button(a, text="Analizar VE",
