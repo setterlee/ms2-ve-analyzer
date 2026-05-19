@@ -22,11 +22,13 @@ jobs:
       - name: Build macOS
         run: |
           pip install pyinstaller
+          echo "${{ github.ref_name }}" > VERSION
           pyinstaller \
             --name "VE-Analyzer" \
             --windowed \
             --onedir \
             --clean \
+            --add-data "VERSION:." \
             ve_analyzer_gui.py
           cd dist
           zip -r "VE-Analyzer-macOS.zip" "VE-Analyzer.app"
@@ -49,7 +51,8 @@ jobs:
       - name: Build Windows
         run: |
           pip install pyinstaller
-          pyinstaller --name "VE-Analyzer" --windowed --onefile --clean ve_analyzer_gui.py
+          echo "${{ github.ref_name }}" > VERSION
+          pyinstaller --name "VE-Analyzer" --windowed --onefile --clean --add-data "VERSION;." ve_analyzer_gui.py
 
       - uses: actions/upload-artifact@v4
         with:

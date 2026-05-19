@@ -24,6 +24,13 @@ else:
 
 
 def _get_version() -> str:
+    # 1. Exe frozen: leer VERSION embebido por PyInstaller en el build
+    if getattr(sys, 'frozen', False):
+        vf = Path(sys._MEIPASS) / 'VERSION'
+        if vf.exists():
+            return vf.read_text(encoding='utf-8').strip().lstrip('v')
+        return "dev"
+    # 2. Desarrollo: leer del tag git en tiempo de ejecución
     try:
         import subprocess
         r = subprocess.run(

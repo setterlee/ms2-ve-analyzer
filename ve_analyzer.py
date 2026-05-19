@@ -254,6 +254,9 @@ def load_ae_config(msq_path: str) -> dict:
     }
 
 
+_POST_AE_COOLDOWN_SECS = 1.5   # segundos de mezcla inestable tras apagarse el AE
+
+
 def load_msl_logs(log_files: list, include_idle: bool = False) -> list:
     """Parsea uno o más .msl (texto tab-delimitado con header binario).
 
@@ -261,6 +264,7 @@ def load_msl_logs(log_files: list, include_idle: bool = False) -> list:
     RPM 600-1200, sin AE, MAP estable) además de las de carga normal.
     """
     all_rows = []
+    _last_ae_secl: dict = {}   # fi -> SecL del último frame con AE activo
     for fi, fname in enumerate(log_files):
         with open(fname, 'rb') as fh:
             raw = fh.read()
@@ -284,6 +288,7 @@ def load_msl_logs(log_files: list, include_idle: bool = False) -> list:
                 mat      = row_raw.get('MAT')
                 if rpm < 400 or not (8.0 < afr < 20.0) or clt < 70:
                     continue
+                secl_val = row_raw.get('SecL', 0) or 0
                 if tps < 3.0:
                     if include_idle:
                         mapdot = row_raw.get('MAPdot', 0)
@@ -294,11 +299,14 @@ def load_msl_logs(log_files: list, include_idle: bool = False) -> list:
                         continue
                 else:
                     if accel_pw > 0.05:
+                        _last_ae_secl[fi] = secl_val
                         continue
                     if abs(rpmdot) > 400:
                         continue
                     mapdot = row_raw.get('MAPdot', 0)
                     if abs(mapdot) > 40:
+                        continue
+                    if secl_val - _last_ae_secl.get(fi, -9999) < _POST_AE_COOLDOWN_SECS:
                         continue
                 if mat is not None and not (38.0 <= mat <= 58.0):
                     continue
@@ -384,18 +392,16 @@ def load_msl_logs(log_files: list, include_idle: bool = False) -> list:
                     continue
             else:
                 # Carga normal: excluir transitorios de AE y desaceleración fuerte.
-                # AE activo (accel_pw > 0.05): el ECU añade combustible extra encima
-                # del VE — el AFR no refleja el VE de la celda sino el transitorio.
-                # RPMdot < -400: motor pasando por la celda en desaceleración;
-                # el llenado del colector no está en estado estacionario.
-                # MAPdot > 40: MAP cambiando rápido = transitorio de carga (ej: carga
-                # subiendo a RPM bajos antes de que el motor responda); no es estado
-                # estacionario y puede dar AFR lean transitorio.
                 if row.get('accel_pw', 0) > 0.05:
+                    _last_ae_secl[fi] = row.get('secl', 0)
                     continue
                 if abs(row.get('rpmdot', 0)) > 400:
                     continue
                 if abs(row.get('mapdot', 0)) > 40:
+                    continue
+                # Excluir el período de estabilización post-AE: la mezcla tarda
+                # ~1.5 s en volver al estado estacionario tras apagarse el enriquecimiento.
+                if row.get('secl', 0) - _last_ae_secl.get(fi, -9999) < _POST_AE_COOLDOWN_SECS:
                     continue
             # Filtro MAT: solo rango térmico estabilizado (evita oscilación por densidad)
             mat = row.get('mat')
