@@ -3297,6 +3297,8 @@ def detect_map_transient_events(rows: list, ae_cfg: dict) -> list:
             mapdot_max = max((abs(r.get('mapdot') or 0) for r in event_rows), default=0)
             tps_avg    = _mean([r.get('tps') or 0 for r in event_rows])
             secl_end   = valid[min(j, n - 1)].get('secl') or secl_start
+            pw_vals    = [r.get('pw') for r in event_rows if r.get('pw') and r['pw'] > 0]
+            pw_avg     = _mean(pw_vals) if pw_vals else None
 
             # AFR lean vs target del pico MAP (no vs baseline)
             ev_afrs = [r.get('afr') for r in event_rows
@@ -3330,6 +3332,7 @@ def detect_map_transient_events(rows: list, ae_cfg: dict) -> list:
                 'afr_peak_lean':   round(afr_peak_lean,     2) if afr_peak_lean else None,
                 'afr_tgt_at_peak': round(afr_tgt_at_peak,  1),
                 'lean_vs_target':  round(lean_vs_target,   2),
+                'pw_avg':          round(pw_avg, 2) if pw_avg else None,
                 'diagnosis':       diag,
             })
 
@@ -3480,6 +3483,122 @@ def print_map_transient_events(events: list, ae_cfg: dict,
         print(f"    3. Tomar log, correr análisis AE, verificar que near-stalls desaparezcan")
     else:
         print(f"  Blend y mapThresh parecen adecuados para la cobertura observada.")
+
+    # ── Evaluación y sugerencia de maeBins ───────────────────────
+    mae_weight = (100 - sug_tps_prop) / 100.0   # fracción de peso MAE en el blend
+
+    print()
+    print("── EVALUACIÓN maeBins ──────────────────────────────────────")
+
+    # Para cada bin de maeRates, recolectar eventos en ese rango de MAPdot
+    # y calcular el PW adicional necesario: needed_pw = pw_avg * (lean / afr_target)
+    # maeBins_sug = needed_pw / mae_weight  (para que la contribución efectiva sea suficiente)
+    bin_edges_mae = [0] + list(mae_rate_vals)
+    cur_mae_bins  = list(mae_bins or [])
+
+    # Calcular needed_pw por bin (solo bins con datos de PW)
+    raw_sug = []    # (lo, hi, n_ev, sug_or_None)
+    for k in range(len(mae_rate_vals)):
+        lo = bin_edges_mae[k]
+        hi = mae_rate_vals[k]
+        # Último bin: sin límite superior
+        bin_evs = [e for e in mae_cand
+                   if (lo <= e['mapdot_max'] < hi if k < len(mae_rate_vals)-1
+                       else e['mapdot_max'] >= lo)
+                   and e.get('pw_avg') and e['lean_vs_target'] > 0.3]
+        if bin_evs:
+            pw_med   = sorted([e['pw_avg']           for e in bin_evs])[len(bin_evs)//2]
+            lean_med = _mean([e['lean_vs_target']    for e in bin_evs])
+            afr_tgt  = _mean([e['afr_tgt_at_peak']  for e in bin_evs])
+            needed_pw = pw_med * (lean_med / afr_tgt)
+            sug = max(0.3, round(needed_pw / mae_weight, 1)) if mae_weight > 0 else needed_pw
+        else:
+            sug = None
+        raw_sug.append((lo, int(hi), len(bin_evs), sug))
+
+    any_data = any(r[3] is not None for r in raw_sug)
+
+    if not any_data:
+        # Sin PW en el log: escalar proporcionalmente desde taeBins
+        tae_bins_l = ae_cfg.get('taeBins') or [0.1, 0.2, 0.3, 0.7]
+        tae_max    = max(tae_bins_l) if tae_bins_l else 0.7
+        mae_max_r  = mae_rate_vals[-1] if mae_rate_vals else 86
+        sug_bins   = [max(0.3, round(tae_max * (r / mae_max_r) / mae_weight, 1))
+                      for r in mae_rate_vals]
+        note = "(estimado proporcional a taeBins — log sin columna PW)"
+    else:
+        # Rellenar bins sin datos interpolando desde los bins con datos
+        sug_bins_raw = [r[3] for r in raw_sug]
+
+        # Encuentra el primer y último bin con datos para interpolar el resto
+        data_idx = [k for k, v in enumerate(sug_bins_raw) if v is not None]
+        if data_idx:
+            v_ref_hi = sug_bins_raw[data_idx[0]]  # primer valor con datos
+            v_ref_lo = sug_bins_raw[data_idx[-1]]  # último valor con datos
+
+        filled = list(sug_bins_raw)
+        for k in range(len(filled)):
+            if filled[k] is None:
+                # Interpolar: escalar proporcionalmente al MAPdot rate
+                rate_k = mae_rate_vals[k]
+                # Buscar vecinos con datos
+                prev = next((filled[j] for j in range(k-1,-1,-1) if filled[j] is not None), None)
+                nxt  = next((filled[j] for j in range(k+1, len(filled)) if filled[j] is not None), None)
+                if prev is not None and nxt is not None:
+                    # Interpolación lineal en el espacio de tasas
+                    pk = next(j for j in range(k-1,-1,-1) if filled[j] is not None)
+                    nk = next(j for j in range(k+1, len(filled)) if filled[j] is not None)
+                    t = (rate_k - mae_rate_vals[pk]) / (mae_rate_vals[nk] - mae_rate_vals[pk])
+                    filled[k] = max(0.3, round(prev + t * (nxt - prev), 1))
+                elif prev is not None:
+                    # Extrapolar hacia adelante (bin más alto)
+                    pk = next(j for j in range(k-1,-1,-1) if filled[j] is not None)
+                    scale = rate_k / mae_rate_vals[pk] if mae_rate_vals[pk] > 0 else 1
+                    filled[k] = max(0.3, round(prev * scale, 1))
+                elif nxt is not None:
+                    # Extrapolar hacia atrás (bin más bajo)
+                    nk = next(j for j in range(k+1, len(filled)) if filled[j] is not None)
+                    scale = rate_k / mae_rate_vals[nk] if mae_rate_vals[nk] > 0 else 1
+                    filled[k] = max(0.3, round(nxt * scale, 1))
+                else:
+                    filled[k] = 0.5
+
+        sug_bins = [max(0.3, round(v, 1)) for v in filled]
+        note = "(calculado: PW_necesario ÷ peso_MAE, interpolado para bins sin datos)"
+
+    print(f"  Peso MAE en el blend sugerido: {mae_weight*100:.0f}%")
+    print(f"  Un maeBin activa así: contribución_efectiva = maeBin × {mae_weight*100:.0f}%")
+    print()
+    print(f"  {'MAPdot':>10}  {'n':>3}  {'maeBin actual':>14}  {'maeBin sugerido':>16}  Δ")
+    print("  " + "─" * 56)
+    for k, (lo, hi, n_ev, _sug) in enumerate(raw_sug):
+        hi_str = f"{hi}+" if k == len(raw_sug)-1 else str(hi)
+        cur = cur_mae_bins[k] if k < len(cur_mae_bins) else "—"
+        sug = sug_bins[k] if k < len(sug_bins) else "?"
+        if isinstance(cur, float) and isinstance(sug, float):
+            d = sug - cur
+            delta = f"{d:+.1f}" if abs(d) > 0.05 else "="
+        else:
+            delta = "?"
+        eff_cur = f"→{cur*mae_weight:.2f}ms ef." if isinstance(cur, float) else ""
+        eff_sug = f"→{sug*mae_weight:.2f}ms ef."
+        print(f"  {lo:>3}–{hi_str:>4} kPa/s  {n_ev:>3}  {str(cur):>6}ms {eff_cur:>14}  "
+              f"{sug:>6}ms {eff_sug:>14}  {delta}")
+    print()
+    print(f"  {note}")
+
+    # ¿Los actuales son planos? (rango max-min < 20% del máximo)
+    if cur_mae_bins and len(cur_mae_bins) >= 2:
+        span = max(cur_mae_bins) - min(cur_mae_bins)
+        if span < max(cur_mae_bins) * 0.20:
+            print(f"  ⚠ maeBins actuales casi planos (rango {span:.2f}ms sobre máx {max(cur_mae_bins):.1f}ms).")
+            print(f"  Deberían escalar con MAPdot, como taeBins escala con TPSdot.")
+
+    if sug_bins != list(cur_mae_bins):
+        print()
+        sug_str = "[" + ", ".join(f"{v:.1f}" for v in sug_bins) + "]"
+        print(f"  Sugerido para TunerStudio → maeBins = {sug_str}")
+        print(f"  (Fuel → Accel Enrichment → MAE curve → fila Added (ms))")
 
 
 # ─────────────────────────────────────────────
