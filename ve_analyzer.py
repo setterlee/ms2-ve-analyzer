@@ -3429,10 +3429,10 @@ def print_map_transient_events(events: list, ae_cfg: dict,
     total_events = len(events) + tae_event_count
     uncov_frac   = len(events) / max(total_events, 1)
 
-    # tpsProportion sugerido: dar suficiente peso a MAE para cubrir la fracción no cubierta
-    # redondeado al múltiplo de 10 más cercano hacia abajo
+    # tpsProportion sugerido: MAE mínimo 20% para que los bins sean razonables.
+    # Bajo 20% los maeBins necesitan ser tan altos (>3.5ms) que se vuelven impráctcos.
     raw_mae_weight = uncov_frac * 100
-    sug_mae_weight = min(50, max(10, int((raw_mae_weight + 9) / 10) * 10))  # ceil a 10%
+    sug_mae_weight = min(50, max(20, int((raw_mae_weight + 9) / 10) * 10))  # ceil a 10%, min 20
     sug_tps_prop   = 100 - sug_mae_weight
 
     # mapThresh sugerido: percentil 20 de los MAPdot de eventos sin cobertura
@@ -3519,11 +3519,14 @@ def print_map_transient_events(events: list, ae_cfg: dict,
     any_data = any(r[3] is not None for r in raw_sug)
 
     if not any_data:
-        # Sin PW en el log: escalar proporcionalmente desde taeBins
+        # Sin PW en el log: los maeBins se escalan para dar una contribución efectiva
+        # (maeBin × mae_weight) comparable a los taeBins a tasas equivalentes.
+        # Techo explícito: nunca más de 3× el taeBin máximo para evitar valores absurdos.
         tae_bins_l = ae_cfg.get('taeBins') or [0.1, 0.2, 0.3, 0.7]
         tae_max    = max(tae_bins_l) if tae_bins_l else 0.7
         mae_max_r  = mae_rate_vals[-1] if mae_rate_vals else 86
-        sug_bins   = [max(0.3, round(tae_max * (r / mae_max_r) / mae_weight, 1))
+        max_bin    = tae_max * 3.0   # techo absoluto
+        sug_bins   = [max(0.3, min(max_bin, round(tae_max * (r / mae_max_r) / mae_weight, 1)))
                       for r in mae_rate_vals]
         note = "(estimado proporcional a taeBins — log sin columna PW)"
     else:
