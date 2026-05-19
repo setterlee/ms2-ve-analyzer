@@ -666,7 +666,8 @@ class VEAnalyzerApp:
             old = sys.stdout; sys.stdout = buf
             print_stall_events(stall_events, ae_cfg)
             print_ae_calibration(result, ae_cfg)
-            print_map_transient_events(map_events, ae_cfg)
+            print_map_transient_events(map_events, ae_cfg,
+                                       tae_event_count=len(tae_events))
             sys.stdout = old
 
             rpt = buf.getvalue()

@@ -242,16 +242,18 @@ def load_ae_config(msq_path: str) -> dict:
         return None
 
     return {
-        'taeRates':    get_values('taeRates'),
-        'taeBins':     get_values('taeBins'),
-        'maeRates':    get_values('maeRates'),
-        'maeBins':     get_values('maeBins'),
-        'taeTime':     get_scalar('taeTime'),
-        'tpsThresh':   get_scalar('tpsThresh'),
-        'aeTaperTime': get_scalar('aeTaperTime'),
-        'aeEndPW':     get_scalar('aeEndPW'),
-        'taeColdA':    get_scalar('taeColdA'),
-        'taeColdM':    get_scalar('taeColdM'),
+        'taeRates':       get_values('taeRates'),
+        'taeBins':        get_values('taeBins'),
+        'maeRates':       get_values('maeRates'),
+        'maeBins':        get_values('maeBins'),
+        'taeTime':        get_scalar('taeTime'),
+        'tpsThresh':      get_scalar('tpsThresh'),
+        'mapThresh':      get_scalar('mapThresh'),      # umbral MAPdot para MAE
+        'tpsProportion':  get_scalar('tpsProportion'),  # % TAE en el blend (100=solo TAE)
+        'aeTaperTime':    get_scalar('aeTaperTime'),
+        'aeEndPW':        get_scalar('aeEndPW'),
+        'taeColdA':       get_scalar('taeColdA'),
+        'taeColdM':       get_scalar('taeColdM'),
     }
 
 
@@ -2717,6 +2719,7 @@ def analyze_ae_calibration(events: list, ae_cfg: dict) -> dict:
         'tae_rates':     tae_rates,
         'tae_bins':      tae_bins,
         'tps_thresh':    tps_thresh,
+        '_raw_events':   events,   # para diagnóstico de parámetros
     }
 
 
@@ -2890,6 +2893,83 @@ def print_ae_calibration(result: dict, ae_cfg: dict):
         print("  Importar en TunerStudio:")
         print("  Fuel → Acceleration Enrichment → TAE curve → fila Added (ms)")
         print()
+
+    # ── Validación de parámetros adicionales de AE ────────────────
+    _print_ae_param_validation(result, ae_cfg)
+
+
+def _print_ae_param_validation(result: dict, ae_cfg: dict) -> None:
+    """Valida los parámetros de AE del MSQ contra los datos observados."""
+    events = result.get('_raw_events', [])
+    tae_time     = ae_cfg.get('taeTime')     or 0.4
+    taper_time   = ae_cfg.get('aeTaperTime') or 0.3
+    ae_end_pw    = ae_cfg.get('aeEndPW')     or 0.0
+    tps_thresh   = ae_cfg.get('tpsThresh')   or 20.0
+    tps_prop     = ae_cfg.get('tpsProportion') or 100.0
+    map_thresh   = ae_cfg.get('mapThresh')   or 100.0
+    mae_rates    = ae_cfg.get('maeRates')    or []
+    mae_bins     = ae_cfg.get('maeBins')     or []
+
+    print("── DIAGNÓSTICO DE PARÁMETROS AE ───────────────────────────")
+    print(f"  {'Parámetro':<22}  {'Valor':>8}  Estado")
+    print("  " + "─" * 58)
+
+    def row(name, val, ok, note):
+        flag = "✓" if ok else "⚠"
+        print(f"  {name:<22}  {str(val):>8}  {flag}  {note}")
+
+    # tpsThresh
+    row("tpsThresh", f"{tps_thresh:.0f} %/s",
+        tps_thresh <= 20,
+        "OK" if tps_thresh <= 15 else
+        "Considerar bajar a 8-12 %/s si hay near-stalls frecuentes")
+
+    # taeTime
+    if events:
+        avg_dur = _mean([e.get('n_samples', 8) / 20.0 for e in events])
+        tae_ok = abs(tae_time - avg_dur) < 0.15
+    else:
+        avg_dur = None
+        tae_ok = True
+    dur_str = f"~{avg_dur:.2f}s obs." if avg_dur else "sin datos"
+    row("taeTime", f"{tae_time} s",
+        tae_ok,
+        f"OK ({dur_str})" if tae_ok else
+        f"Duración AE obs. {dur_str} → ajustar a {avg_dur:.1f}s" if avg_dur else "OK")
+
+    # aeTaperTime
+    row("aeTaperTime", f"{taper_time} s",
+        taper_time >= 0.2,
+        "OK" if taper_time >= 0.2 else
+        "Demasiado corto — lean al final del AE; subir a 0.3-0.5s")
+
+    # aeEndPW
+    row("aeEndPW", f"{ae_end_pw} ms",
+        ae_end_pw == 0.0 or ae_end_pw < 0.2,
+        "OK" if ae_end_pw < 0.2 else
+        f"Impide PW de AE < {ae_end_pw}ms — puede cortar enriquecimiento pequeño")
+
+    # tpsProportion / mapThresh
+    row("tpsProportion", f"{tps_prop:.0f}%",
+        tps_prop < 100,
+        "OK" if tps_prop < 100 else
+        "100% = solo TAE; MAE ignorado — considerar blend 70-80%")
+
+    row("mapThresh", f"{map_thresh:.0f} kPa/s",
+        map_thresh <= (mae_rates[0] if mae_rates else 30),
+        "OK" if map_thresh <= (mae_rates[0] if mae_rates else 30) else
+        f"Por encima del primer maeRates bin ({mae_rates[0] if mae_rates else '?'} kPa/s)"
+        f" → MAE nunca activa")
+
+    # maeBins no-zero
+    if mae_bins:
+        all_zero = all((v or 0) == 0 for v in mae_bins)
+        row("maeBins", str(mae_bins),
+            not all_zero,
+            "OK — MAE tiene valores configurados" if not all_zero else
+            "Todos en 0 — MAE no enrichece nada")
+
+    print()
 
 
 _STALL_RPM_DROP      = 500    # RPM mínima previa para considerar un apagón real
@@ -3258,7 +3338,8 @@ def detect_map_transient_events(rows: list, ae_cfg: dict) -> list:
     return events
 
 
-def print_map_transient_events(events: list, ae_cfg: dict) -> None:
+def print_map_transient_events(events: list, ae_cfg: dict,
+                               tae_event_count: int = 0) -> None:
     """
     Reporta transitorios MAP sin cobertura TAE y evalúa si activar MAE
     o ajustar tpsThresh.
@@ -3337,50 +3418,68 @@ def print_map_transient_events(events: list, ae_cfg: dict) -> None:
     avg_mapdot = _mean([e['mapdot_max']    for e in mae_cand])
     avg_lean   = _mean([e['lean_vs_target'] for e in lean_events]) if lean_events else 0
 
-    print("── EVALUACIÓN ──────────────────────────────────────────────")
-    print(f"  TPSdot promedio en eventos sin TAE : {avg_tpsdot:.0f} %/s  (tpsThresh: {tps_thresh:.0f} %/s)")
-    print(f"  MAPdot promedio en esos eventos    : {avg_mapdot:.0f} kPa/s")
-    if lean_events:
-        print(f"  Lean promedio vs target            : +{avg_lean:.1f} AFR")
+    # ── Cálculo del blend sugerido ───────────────────────────────
+    cur_tps_prop  = ae_cfg.get('tpsProportion') or 100.0
+    cur_map_thresh = ae_cfg.get('mapThresh')    or 100.0
+    mae_rate_vals = list(mae_rates or [15, 30, 60, 86])
+
+    total_events = len(events) + tae_event_count
+    uncov_frac   = len(events) / max(total_events, 1)
+
+    # tpsProportion sugerido: dar suficiente peso a MAE para cubrir la fracción no cubierta
+    # redondeado al múltiplo de 10 más cercano hacia abajo
+    raw_mae_weight = uncov_frac * 100
+    sug_mae_weight = min(50, max(10, int((raw_mae_weight + 9) / 10) * 10))  # ceil a 10%
+    sug_tps_prop   = 100 - sug_mae_weight
+
+    # mapThresh sugerido: percentil 20 de los MAPdot de eventos sin cobertura
+    # mínimo = primer bin maeRates, máximo = mapThresh actual
+    mapdots = sorted([e['mapdot_max'] for e in mae_cand if e['mapdot_max'] > 0])
+    if mapdots:
+        p20 = mapdots[max(0, int(len(mapdots) * 0.20))]
+        sug_map_thresh = max(5, int(p20 / 5) * 5)   # redondear al múltiplo de 5
+        sug_map_thresh = min(sug_map_thresh, int(mae_rate_vals[0]))
+    else:
+        sug_map_thresh = int(mae_rate_vals[0]) if mae_rate_vals else 15
+
+    print("── CONFIGURACIÓN ACTUAL vs SUGERIDA ────────────────────────")
+    print(f"  {'Parámetro':<22}  {'Actual':>8}  {'Sugerido':>9}  Ubicación en TunerStudio")
+    print("  " + "─" * 68)
+    tps_flag  = "✓" if cur_tps_prop == sug_tps_prop else "⚠"
+    map_flag  = "✓" if cur_map_thresh <= sug_map_thresh + 5 else "⚠"
+    print(f"  {'tpsProportion (TPS%)':<22}  {cur_tps_prop:>7.0f}%  {sug_tps_prop:>8}%"
+          f"  {tps_flag}  Fuel→Accel Enrichment→TPS%")
+    print(f"  {'mapThresh':<22}  {cur_map_thresh:>6.0f} kPa/s  {sug_map_thresh:>6} kPa/s"
+          f"  {map_flag}  Fuel→Accel Enrichment→MAP Threshold")
     print()
 
-    # A) tpsThresh: solo sugerir si hay eventos donde tpsdot < tpsThresh
-    pure_mae = [e for e in events if e['tpsdot_max'] < tps_thresh]
-    if pure_mae:
-        avg_pure = _mean([e['tpsdot_max'] for e in pure_mae])
-        sug = max(5, int(avg_pure * 0.8))
-        print(f"  A) Bajar tpsThresh: {tps_thresh:.0f} → {sug} %/s")
-        print(f"     Capturaría los {len(pure_mae)} eventos con TPSdot ≈ {avg_pure:.0f} %/s.")
-        print(f"     Riesgo: AE en cargas pasivas (cuesta arriba sin mover el TPS).")
-    else:
-        sug = max(5, int(tps_thresh * 0.65))
-        print(f"  A) Bajar tpsThresh: {tps_thresh:.0f} → {sug} %/s  (más margen vs filtro ECU)")
-        print(f"     El ECU tiene filtro/debounce interno más agresivo que el log.")
-        print(f"     Reducir el umbral da margen para que el ECU active TAE antes.")
+    # ── Barra visual del blend ────────────────────────────────────
+    BAR = 30
+    def _bar(tps_pct):
+        tae_w = round(BAR * tps_pct / 100)
+        mae_w = BAR - tae_w
+        return f"TAE [{'█'*tae_w}{'░'*mae_w}] {tps_pct:.0f}%  /  MAE [{'░'*tae_w}{'█'*mae_w}] {100-tps_pct:.0f}%"
+
+    print(f"  Blend actual   : {_bar(cur_tps_prop)}")
+    print(f"  Blend sugerido : {_bar(sug_tps_prop)}")
     print()
 
-    print(f"  B) Activar / ajustar MAE (maeRates = sensibilidad al MAPdot):")
-    if mae_rates and mae_bins:
-        all_zero = all((v or 0) == 0 for v in mae_bins)
-        if all_zero:
-            print(f"     maeBins = {mae_bins}  ← MAE desactivado")
-            print(f"     maeRates = {mae_rates}")
-            print(f"     Punto de partida: maeBins = [0.3, 0.8, 1.2, 1.5] ms")
-            print(f"     Toma logs y ajusta hasta que las celdas MAP={int(avg_mapdot)} kPa/s")
-            print(f"     dejen de aparecer lean en el análisis VE.")
-        else:
-            print(f"     MAE configurado: maeRates={[int(r) for r in mae_rates]}")
-            print(f"                      maeBins ={mae_bins}")
-            print(f"     Si el AE Type en TunerStudio está en 'TPS only', MAE no aplica.")
-            print(f"     Cambia a 'MAP+TPS blend' para que maeBins entre en efecto.")
-            print(f"     Con MAPdot típico de {int(avg_mapdot)} kPa/s los bins actuales")
-            print(f"     podrían ser suficientes — prueba primero habilitando el blend.")
+    # ── Explicación ───────────────────────────────────────────────
+    if cur_tps_prop > sug_tps_prop or cur_map_thresh > sug_map_thresh + 5:
+        print(f"  Motivo del ajuste:")
+        if len(events) > 0:
+            print(f"    · {len(events)} transitorios MAP ({uncov_frac*100:.0f}% del total) no cubiertos por TAE")
+            print(f"    · Lean promedio en esos eventos: +{avg_lean:.1f} AFR vs target")
+        if cur_map_thresh > sug_map_thresh + 5:
+            print(f"    · mapThresh actual ({cur_map_thresh:.0f}) supera el MAPdot de los eventos")
+            print(f"      problemáticos ({avg_mapdot:.0f} kPa/s) — MAE nunca activa en ellos")
+        print()
+        print(f"  Pasos en TunerStudio:")
+        print(f"    1. Fuel → Accel Enrichment → MAP AE Threshold = {sug_map_thresh} kPa/s")
+        print(f"    2. Fuel → Accel Enrichment → TPS% = {sug_tps_prop}")
+        print(f"    3. Tomar log, correr análisis AE, verificar que near-stalls desaparezcan")
     else:
-        print(f"     maeRates/maeBins no encontrados en el MSQ.")
-    print()
-    print(f"  C) Blend MAE + TAE (recomendado para N/A con cuerpo lento):")
-    print(f"     TAE cubre aceleraciones de pedal (TPSdot alto).")
-    print(f"     MAE cubre subidas de carga lentas (MAPdot sin TPSdot).")
+        print(f"  Blend y mapThresh parecen adecuados para la cobertura observada.")
 
 
 # ─────────────────────────────────────────────
