@@ -19,6 +19,7 @@ import os
 import re
 import struct
 import sys
+from collections import deque
 from datetime import datetime
 from pathlib import Path
 
@@ -255,6 +256,8 @@ def load_ae_config(msq_path: str) -> dict:
 
 
 _POST_AE_COOLDOWN_SECS = 1.5   # segundos de mezcla inestable tras apagarse el AE
+_MAP_HISTORY_SECS      = 2.0   # ventana para detectar reversión de MAP
+_MAP_REVERT_KPA        = 4.0   # si MAP cayó >4 kPa desde su pico en la ventana → transitorio
 
 
 def load_msl_logs(log_files: list, include_idle: bool = False) -> list:
@@ -265,6 +268,7 @@ def load_msl_logs(log_files: list, include_idle: bool = False) -> list:
     """
     all_rows = []
     _last_ae_secl: dict = {}   # fi -> SecL del último frame con AE activo
+    _map_hist:     dict = {}   # fi -> deque[(secl, map)] para detectar reversión
     for fi, fname in enumerate(log_files):
         with open(fname, 'rb') as fh:
             raw = fh.read()
@@ -310,9 +314,18 @@ def load_msl_logs(log_files: list, include_idle: bool = False) -> list:
                         continue
                 if mat is not None and not (38.0 <= mat <= 58.0):
                     continue
+                map_val = row_raw.get('MAP', 0)
+                _mh = _map_hist.setdefault(fi, deque())
+                _mh.append((secl_val, map_val))
+                while _mh and secl_val - _mh[0][0] > _MAP_HISTORY_SECS:
+                    _mh.popleft()
+                if len(_mh) >= 2:
+                    _peak = max(m for _, m in _mh)
+                    if _peak - map_val > _MAP_REVERT_KPA and _peak - _mh[0][1] > _MAP_REVERT_KPA:
+                        continue
                 all_rows.append({
                     'rpm':      rpm,
-                    'map':      row_raw.get('MAP', 0),
+                    'map':      map_val,
                     'afr':      afr,
                     'tps':      tps,
                     'clt':      clt,
@@ -407,6 +420,16 @@ def load_msl_logs(log_files: list, include_idle: bool = False) -> list:
             mat = row.get('mat')
             if mat is not None and not (38.0 <= mat <= 58.0):
                 continue
+            _secl = row.get('secl', 0)
+            _mval = row.get('map', 0)
+            _mh = _map_hist.setdefault(fi, deque())
+            _mh.append((_secl, _mval))
+            while _mh and _secl - _mh[0][0] > _MAP_HISTORY_SECS:
+                _mh.popleft()
+            if len(_mh) >= 2:
+                _peak = max(m for _, m in _mh)
+                if _peak - _mval > _MAP_REVERT_KPA and _peak - _mh[0][1] > _MAP_REVERT_KPA:
+                    continue
             row['file_idx'] = fi
             all_rows.append(row)
 
