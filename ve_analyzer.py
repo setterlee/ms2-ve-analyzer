@@ -2892,6 +2892,245 @@ def print_ae_calibration(result: dict, ae_cfg: dict):
         print()
 
 
+_STALL_RPM_DROP      = 500    # RPM mínima previa para considerar un apagón real
+_STALL_RPM_STALL     = 200    # RPM a la que se considera apagón completo
+_NEAR_STALL_RPM      = 1000   # RPM umbral para near-stall
+_NEAR_STALL_MAP_RISE = 8.0    # kPa: subida mínima en near-stall para ser significativo
+_NEAR_STALL_AFR_LEAN = 1.5    # AFR sobre target para clasificar near-stall como lean
+_STALL_PRE_SECS      = 8.0    # ventana de análisis antes del apagón
+
+
+def detect_stall_events(rows: list, ae_cfg: dict) -> list:
+    """
+    Detecta apagones completos (RPM → 0) y near-stalls (RPM < 950 con MAP
+    subiendo sin AE y mezcla lean).  Solo analiza ventanas cortas para evitar
+    contaminación con eventos anteriores.
+    """
+    tps_thresh = ae_cfg.get('tpsThresh') or 20.0
+
+    events: list = []
+    by_file: dict = {}
+    for r in rows:
+        s = r.get('secl')
+        if s is None or s != s:
+            continue
+        by_file.setdefault(r.get('file_idx', 0), []).append(r)
+
+    for fi, file_rows in by_file.items():
+        n = len(file_rows)
+        if n < 20:
+            continue
+
+        # Detect sample rate
+        secls = [r.get('secl') or 0 for r in file_rows[:50] if r.get('rpm')]
+        hz = 12.0
+        if len(secls) >= 10:
+            span = secls[-1] - secls[0]
+            if span > 0:
+                hz = (len(secls) - 1) / span
+
+        win2  = max(3, int(hz * 2.0))   # 2-second window in frames
+        win6  = max(8, int(hz * 6.0))   # 6-second context window
+
+        i = win2
+        while i < n - win2:
+            r    = file_rows[i]
+            rpm  = r.get('rpm') or 0
+            secl = r.get('secl') or 0
+
+            # ── Candidatos ──────────────────────────────────────
+            # Apagón: RPM hit 0 from running
+            pre_rpms = [file_rows[j].get('rpm') or 0 for j in range(max(0,i-win2), i)]
+            rpm_pre  = max(pre_rpms) if pre_rpms else 0
+
+            is_stall = rpm_pre > _STALL_RPM_DROP and rpm < _STALL_RPM_STALL
+
+            # Near-stall: use a tight 2s window centered around the RPM dip
+            is_near_stall = False
+            if (not is_stall
+                    and rpm_pre > _STALL_RPM_DROP
+                    and rpm < _NEAR_STALL_RPM       # < 1000
+                    and rpm > _STALL_RPM_STALL       # > 200
+                    and (r.get('tps') or 0) < 20):  # not WOT
+                # 2s window: only running frames, no atmospheric MAP
+                win = [file_rows[j] for j in range(max(0,i-win2), i+win2)
+                       if (file_rows[j].get('rpm') or 0) > 200
+                       and (file_rows[j].get('map') or 0) < 80]
+                if len(win) >= 4:
+                    # RPM must reach < 950 in this window (not just a transient frame)
+                    rpm_min_win = min(x.get('rpm') or 9999 for x in win)
+                    # MAP rose >= 8 kPa
+                    maps_win = [x.get('map') or 0 for x in win]
+                    map_rise = max(maps_win) - min(maps_win)
+                    # No AE in window
+                    ae_win = any((x.get('ae_pct') or 100.0) > 105.0 for x in win)
+                    # AFR went lean vs target of peak MAP
+                    afrs_win = [x.get('afr') for x in win
+                                if x.get('afr') and 10 < x['afr'] < 20]
+                    afr_pk = max(afrs_win) if afrs_win else 0
+                    afr_lean = (afr_pk - target_afr(max(maps_win))
+                                if maps_win else 0)
+
+                    if (rpm_min_win < _NEAR_STALL_RPM
+                            and map_rise >= _NEAR_STALL_MAP_RISE
+                            and not ae_win
+                            and afr_lean >= _NEAR_STALL_AFR_LEAN):
+                        is_near_stall = True
+
+            if not (is_stall or is_near_stall):
+                i += 1
+                continue
+
+            # Dedup
+            if events and abs(secl - events[-1]['secl_stall']) < 5:
+                i += 1
+                continue
+
+            # ── Ventana pre-stall (6s, solo frames válidos) ──────
+            pre = [file_rows[j] for j in range(max(0, i-win6), i)
+                   if (file_rows[j].get('rpm') or 0) > 200
+                   and (file_rows[j].get('map') or 0) < 80]
+            if not pre:
+                i += 1
+                continue
+
+            maps     = [x.get('map') or 0 for x in pre]
+            map_min  = min(maps); map_max = max(maps)
+            map_at_s = file_rows[max(0,i-1)].get('map') or 0
+            rpm_trend = _mean([x.get('rpm') or 0 for x in pre[-10:]])
+            first_rpm = (pre[0].get('rpm') or 0)
+            in_decel  = first_rpm > rpm_trend + 200
+
+            ae_fired  = any((x.get('ae_pct') or 100.0) > 105.0 for x in pre)
+            accel_max = max((x.get('accel_pw') or 0) for x in pre)
+            tpsdot_mx = max((abs(x.get('tpsdot') or 0) for x in pre), default=0)
+            mapdot_mx = max((abs(x.get('mapdot') or 0) for x in pre), default=0)
+
+            # Actual minimum RPM during the event
+            rpm_min_event = min(
+                (file_rows[j].get('rpm') or 9999 for j in range(max(0,i-win2), i+win2)),
+                default=rpm)
+
+            parts_diag = []
+            if in_decel:
+                parts_diag.append(f"RPM en decel ({first_rpm:.0f}→{int(rpm_trend)})")
+            if map_max - map_min > 3:
+                parts_diag.append(f"MAP subió {map_max-map_min:.1f} kPa")
+            if not ae_fired:
+                if tpsdot_mx >= tps_thresh:
+                    parts_diag.append(
+                        f"AE no activó (TPSdot={tpsdot_mx:.0f} ≥ {tps_thresh:.0f} %/s — filtro ECU)")
+                elif tpsdot_mx > 0:
+                    parts_diag.append(
+                        f"AE no activó (TPSdot={tpsdot_mx:.0f} < {tps_thresh:.0f} %/s)")
+                else:
+                    parts_diag.append("TPS cerrado — apagón sin transición de carga")
+            else:
+                parts_diag.append(f"AE activó ({accel_max:.2f} ms) pero insuficiente")
+
+            events.append({
+                'secl_stall':   round(secl,          1),
+                'file_idx':     fi,
+                'event_type':   'stall' if is_stall else 'near-stall',
+                'rpm_pre':      round(rpm_pre,        0),
+                'rpm_min':      round(rpm_min_event,  0),
+                'rpm_trend':    round(rpm_trend,      0),
+                'in_decel':     in_decel,
+                'map_pre':      round(map_at_s,       1),
+                'map_rise':     round(map_max - map_min, 1),
+                'map_peak':     round(map_max,        1),
+                'tpsdot_max':   round(tpsdot_mx,      1),
+                'mapdot_max':   round(mapdot_mx,      1),
+                'ae_fired':     ae_fired,
+                'accel_pw_max': round(accel_max,      3),
+                'diagnosis':    '; '.join(parts_diag) if parts_diag else 'Ver datos',
+                'pre_rows':     pre[-12:],
+            })
+
+            i += win2
+
+    return events
+
+
+def print_stall_events(events: list, ae_cfg: dict) -> None:
+    """
+    Imprime análisis de apagones con condiciones AE pre-stall.
+    """
+    tps_thresh = ae_cfg.get('tpsThresh') or 20.0
+
+    print('\n' + '=' * 60)
+    print('  APAGONES — Condiciones AE Pre-Stall')
+    print('=' * 60)
+
+    if not events:
+        print("  No se detectaron apagones ni near-stalls en el log.")
+        return
+
+    n_stall = sum(1 for e in events if e['event_type'] == 'stall')
+    n_near  = sum(1 for e in events if e['event_type'] == 'near-stall')
+    ae_gap  = sum(1 for e in events if not e['ae_fired'])
+    ae_weak = sum(1 for e in events if     e['ae_fired'])
+
+    print(f"  Apagones completos   : {n_stall}  (RPM → 0)")
+    print(f"  Near-stalls          : {n_near}   (RPM < {_NEAR_STALL_RPM}, MAP subió sin AE, mezcla lean)")
+    ae_gap  = ae_gap   # redeclare to avoid duplicate
+    if ae_gap:
+        print(f"  Sin AE en ventana pre-stall : {ae_gap}")
+    if ae_weak:
+        print(f"  Con AE pero insuficiente    : {ae_weak}")
+
+    for e in events:
+        tipo = "APAGÓN" if e['event_type'] == 'stall' else "NEAR-STALL"
+        print(f"\n  {'─'*56}")
+        rpm_min_disp = e.get('rpm_min', e['rpm_pre'])
+        print(f"  {tipo} @ SecL {e['secl_stall']:.1f}   "
+              f"RPM mínima: {rpm_min_disp:.0f}  (RPM previa: {e['rpm_pre']:.0f})")
+        print(f"  {'─'*56}")
+        if e['in_decel']:
+            print(f"  Motor venía en decel — RPM promedio ventana: {e['rpm_trend']:.0f}")
+
+        print(f"\n  Ventana pre-stall ({_STALL_PRE_SECS:.0f}s):")
+        print(f"    MAP: {e['map_pre']:.1f} kPa  "
+              f"(subida de +{e['map_rise']:.1f} kPa en la ventana)")
+        print(f"    TPSdot máx: {e['tpsdot_max']:.0f} %/s   "
+              f"tpsThresh: {tps_thresh:.0f} %/s")
+        print(f"    MAPdot máx: {e['mapdot_max']:.0f} kPa/s")
+
+        ae_str = (f"NO activó  (ae_pct=100% todo el tiempo)"
+                  if not e['ae_fired']
+                  else f"Activó — accel_pw_max={e['accel_pw_max']:.2f} ms")
+        print(f"    AE:         {ae_str}")
+
+        # Tabla de frames pre-stall
+        pre = e['pre_rows']
+        if pre:
+            print(f"\n  Últimos frames antes del apagón:")
+            print(f"    {'SecL':>6} {'RPM':>5} {'MAP':>5} {'TPS':>5} "
+                  f"{'AFR':>6} {'AE_PW':>6} {'ae%':>5} {'MAPdt':>6}")
+            print("    " + "─" * 52)
+            prev_s = -99
+            for r in pre:
+                s = r.get('secl') or 0
+                if s == prev_s: continue
+                print(f"    {s:6.1f} {r.get('rpm') or 0:5.0f}"
+                      f" {r.get('map') or 0:5.1f} {r.get('tps') or 0:5.1f}"
+                      f" {r.get('afr') or 0:6.2f} {r.get('accel_pw') or 0:6.3f}"
+                      f" {r.get('ae_pct') or 100:5.0f}"
+                      f" {r.get('mapdot') or 0:6.0f}")
+                prev_s = s
+
+        print(f"\n  Diagnóstico: {e['diagnosis']}")
+
+    # Recomendaciones
+    if ae_gap:
+        print(f"\n  {'─'*56}")
+        print(f"  ACCIÓN: Los apagones ocurrieron sin AE activo.")
+        print(f"  Son la consecuencia directa de los eventos MAP sin cobertura")
+        print(f"  reportados arriba. Mismo fix aplica:")
+        print(f"    · Bajar tpsThresh ({tps_thresh:.0f} → {max(5,int(tps_thresh*0.65)):.0f} %/s)")
+        print(f"    · Activar MAE blend para cubrir transiciones de MAP")
+
+
 def detect_map_transient_events(rows: list, ae_cfg: dict) -> list:
     """
     Detecta subidas de MAP donde el AE no cubrió el transitorio.

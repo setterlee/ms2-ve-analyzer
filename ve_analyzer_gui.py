@@ -53,6 +53,7 @@ from ve_analyzer import (
     analyze_health, _fmt_health_report,
     detect_ae_events, analyze_ae_calibration, print_ae_calibration,
     detect_map_transient_events, print_map_transient_events,
+    detect_stall_events, print_stall_events,
     print_report, print_effectiveness, print_cell_detail,
 )
 
@@ -653,12 +654,17 @@ class VEAnalyzerApp:
 
             print("Detectando transitorios MAP (TAE vs MAE)…")
             map_events = detect_map_transient_events(rows, ae_cfg)
-            print(f"  {len(map_events)} eventos MAP detectados.")
+            print(f"  {len(map_events)} eventos MAP sin cobertura.")
+
+            print("Detectando apagones…")
+            stall_events = detect_stall_events(rows, ae_cfg)
+            print(f"  {len(stall_events)} apagón(es) detectado(s).")
 
             result = analyze_ae_calibration(tae_events, ae_cfg)
 
             buf = io.StringIO()
             old = sys.stdout; sys.stdout = buf
+            print_stall_events(stall_events, ae_cfg)
             print_ae_calibration(result, ae_cfg)
             print_map_transient_events(map_events, ae_cfg)
             sys.stdout = old
