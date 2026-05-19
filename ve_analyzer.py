@@ -2479,9 +2479,10 @@ AE_CLT_MIN     = 70.0
 AE_RPM_MIN     = 700.0
 AE_MIN_SAMPLES = 2      # muestras mínimas con AE activo para contar el evento
 
-_MAP_EVENT_MIN_RISE_KPA = 6.0   # subida mínima de MAP para registrar un evento
+_MAP_EVENT_MIN_RISE_KPA = 8.0   # subida mínima de MAP para registrar un evento
 _MAP_EVENT_WINDOW_SECS  = 5.0   # duración máxima de un evento (s)
-_MAP_EVENT_PRE_FRAMES   = 20    # frames previos para calcular baseline MAP/AFR
+_MAP_EVENT_PRE_FRAMES   = 20    # frames previos para calcular baseline MAP
+_MAP_EVENT_AE_SEARCH    = 12    # frames extra pre-evento para buscar TAE temprano
 
 
 def detect_ae_events(rows: list, ae_cfg: dict,
@@ -2893,20 +2894,25 @@ def print_ae_calibration(result: dict, ae_cfg: dict):
 
 def detect_map_transient_events(rows: list, ae_cfg: dict) -> list:
     """
-    Detecta eventos de carga transitoria (subidas de MAP) en el log completo,
-    independientemente de si el AE se activó.  Complementa detect_ae_events():
-    captura los transitorios lentos donde TPSdot nunca superó el umbral TAE.
+    Detecta subidas de MAP donde el AE no cubrió el transitorio.
 
-    Trabaja sobre filas de load_msl_full (sin filtrar).
+    La búsqueda de accel_pw incluye _MAP_EVENT_AE_SEARCH frames ANTES del
+    inicio del evento, porque TAE dispara al inicio del movimiento de TPS
+    (cuando MAP aún no ha subido _MAP_EVENT_MIN_RISE_KPA).
+
+    Solo retorna eventos donde accel_pw_max < 0.1 ms en toda la ventana
+    ampliada.  Los eventos con TAE activo ya son analizados por
+    detect_ae_events / analyze_ae_calibration.
     """
     tps_thresh = ae_cfg.get('tpsThresh') or 20.0
-    PRE = _MAP_EVENT_PRE_FRAMES
+    PRE  = _MAP_EVENT_PRE_FRAMES
+    SRCH = _MAP_EVENT_AE_SEARCH
 
     events: list = []
     by_file: dict = {}
     for r in rows:
         s = r.get('secl')
-        if s is None or s != s:          # descartar NaN
+        if s is None or s != s:
             continue
         by_file.setdefault(r.get('file_idx', 0), []).append(r)
 
@@ -2923,7 +2929,7 @@ def detect_map_transient_events(rows: list, ae_cfg: dict) -> list:
             secl    = row.get('secl') or 0
             cur_map = row.get('map')  or 0
 
-            pre      = valid[max(0, i - PRE): i]
+            pre = valid[max(0, i - PRE): i]
             if len(pre) < 3:
                 i += 1
                 continue
@@ -2933,7 +2939,7 @@ def detect_map_transient_events(rows: list, ae_cfg: dict) -> list:
                 i += 1
                 continue
 
-            # ── Recopilar frames del evento ──────────────────────
+            # ── Frames del evento ─────────────────────────────────
             event_start = i
             secl_start  = secl
             peak_map    = cur_map
@@ -2956,52 +2962,56 @@ def detect_map_transient_events(rows: list, ae_cfg: dict) -> list:
                 i = j + 1
                 continue
 
-            secl_end = valid[min(j, n - 1)].get('secl') or secl_start
+            # ── AE en ventana AMPLIADA ────────────────────────────
+            # Misma detección que detect_ae_events: ae_pct > 105
+            broad_rows   = valid[max(0, event_start - SRCH): j + 1]
+            ae_active    = any((r.get('ae_pct') or 100.0) > 105.0 for r in broad_rows)
+            accel_pw_max = max((r.get('accel_pw') or 0) for r in broad_rows)
 
-            # ── AE ───────────────────────────────────────────────
-            ae_fired     = any((r.get('accel_pw') or 0) > 0.05 for r in event_rows)
-            accel_pw_max = max((r.get('accel_pw') or 0) for r in event_rows)
-            tpsdot_max   = max((abs(r.get('tpsdot') or 0) for r in event_rows), default=0)
-            mapdot_max   = max((abs(r.get('mapdot') or 0) for r in event_rows), default=0)
-            tps_avg      = _mean([r.get('tps') or 0 for r in event_rows])
+            # Saltar si TAE ya cubrió el evento — lo analiza el TAE calibration
+            if ae_active:
+                i = j + 1
+                continue
 
-            # ── AFR ──────────────────────────────────────────────
-            afr_pre = [r.get('afr') for r in pre if r.get('afr') and 10 < r['afr'] < 20]
-            afr_before   = _mean(afr_pre) if len(afr_pre) >= 2 else None
-            ev_afrs = [r.get('afr') for r in event_rows if r.get('afr') and 10 < r['afr'] < 20]
-            afr_peak_lean = max(ev_afrs) if ev_afrs else None
-            afr_delta = (afr_peak_lean - afr_before
-                         if afr_peak_lean and afr_before else 0.0)
+            # ── Métricas ──────────────────────────────────────────
+            tpsdot_max = max((abs(r.get('tpsdot') or 0) for r in broad_rows), default=0)
+            mapdot_max = max((abs(r.get('mapdot') or 0) for r in event_rows), default=0)
+            tps_avg    = _mean([r.get('tps') or 0 for r in event_rows])
+            secl_end   = valid[min(j, n - 1)].get('secl') or secl_start
 
-            # ── Diagnóstico ───────────────────────────────────────
-            if not ae_fired:
-                if tpsdot_max < tps_thresh:
-                    diag = (f"TAE no activó — TPSdot {tpsdot_max:.0f} < tpsThresh "
-                            f"{tps_thresh:.0f} %/s → candidato MAE")
-                else:
-                    diag = (f"TAE no activó a pesar de TPSdot {tpsdot_max:.0f} %/s "
-                            f"(revisar delay/threshold)")
-            elif afr_delta > 0.8:
-                diag = (f"TAE activó pero insuficiente — lean +{afr_delta:.1f} AFR")
+            # AFR lean vs target del pico MAP (no vs baseline)
+            ev_afrs = [r.get('afr') for r in event_rows
+                       if r.get('afr') and 10 < r['afr'] < 20]
+            afr_peak_lean   = max(ev_afrs) if ev_afrs else None
+            afr_tgt_at_peak = target_afr(peak_map)
+            lean_vs_target  = ((afr_peak_lean - afr_tgt_at_peak)
+                                if afr_peak_lean else 0.0)
+
+            # Diagnóstico
+            if tpsdot_max < tps_thresh:
+                diag = (f"TPSdot {tpsdot_max:.0f} < {tps_thresh:.0f} \u2014 "
+                        + (f"lean +{lean_vs_target:.1f} AFR \u2192 MAE candidato"
+                           if lean_vs_target > 0.5
+                           else "mezcla aceptable"))
             else:
-                diag = "TAE respondió OK"
+                diag = (f"TPSdot {tpsdot_max:.0f} \u2265 {tps_thresh:.0f} %/s "
+                        f"\u2014 ECU no activó AE (posible filtro/delay interno)")
 
             events.append({
-                'secl_start':    round(secl_start,    1),
-                'secl_end':      round(secl_end,       1),
-                'file_idx':      fi,
-                'map_base':      round(base_map,       1),
-                'map_peak':      round(peak_map,       1),
-                'map_rise':      round(peak_map - base_map, 1),
-                'tps_avg':       round(tps_avg,        1),
-                'tpsdot_max':    round(tpsdot_max,     1),
-                'mapdot_max':    round(mapdot_max,     1),
-                'ae_fired':      ae_fired,
-                'accel_pw_max':  round(accel_pw_max,   3),
-                'afr_before':    round(afr_before,     2) if afr_before  else None,
-                'afr_peak_lean': round(afr_peak_lean,  2) if afr_peak_lean else None,
-                'afr_delta':     round(afr_delta,      2),
-                'diagnosis':     diag,
+                'secl_start':      round(secl_start,       1),
+                'secl_end':        round(secl_end,          1),
+                'file_idx':        fi,
+                'map_base':        round(base_map,          1),
+                'map_peak':        round(peak_map,          1),
+                'map_rise':        round(peak_map - base_map, 1),
+                'tps_avg':         round(tps_avg,           1),
+                'tpsdot_max':      round(tpsdot_max,        1),
+                'mapdot_max':      round(mapdot_max,        1),
+                'accel_pw_max':    round(accel_pw_max,      3),
+                'afr_peak_lean':   round(afr_peak_lean,     2) if afr_peak_lean else None,
+                'afr_tgt_at_peak': round(afr_tgt_at_peak,  1),
+                'lean_vs_target':  round(lean_vs_target,   2),
+                'diagnosis':       diag,
             })
 
             i = j + 1
@@ -3011,87 +3021,127 @@ def detect_map_transient_events(rows: list, ae_cfg: dict) -> list:
 
 def print_map_transient_events(events: list, ae_cfg: dict) -> None:
     """
-    Imprime análisis de eventos MAP transitorio y evalúa si la configuración
-    TAE-only es suficiente o se necesita MAE / blend MAPdot+TPSdot.
+    Reporta transitorios MAP sin cobertura TAE y evalúa si activar MAE
+    o ajustar tpsThresh.
     """
     tps_thresh = ae_cfg.get('tpsThresh') or 20.0
     mae_rates  = ae_cfg.get('maeRates')
     mae_bins   = ae_cfg.get('maeBins')
 
     print('\n' + '=' * 60)
-    print('  TRANSITORIOS DE MAP — evaluación TAE vs MAE')
+    print('  COBERTURA AE EN TRANSITORIOS MAP')
     print('=' * 60)
 
     if not events:
-        print("  Sin eventos MAP significativos detectados.")
+        print("  TAE cubrió todos los transitorios MAP detectados.")
+        print("  No se encontraron subidas de MAP sin enriquecimiento.")
         return
 
-    total        = len(events)
-    ae_on_count  = sum(1 for e in events if     e['ae_fired'])
-    ae_off_count = sum(1 for e in events if not e['ae_fired'])
-    lean_count   = sum(1 for e in events if e['afr_delta'] > 0.5)
-    tae_gap      = sum(1 for e in events
-                       if not e['ae_fired'] and e['tpsdot_max'] < tps_thresh)
+    lean_events = [e for e in events if e['lean_vs_target'] > 0.5]
+    mae_cand    = [e for e in events if e['tpsdot_max'] < tps_thresh]
 
-    print(f"  Eventos MAP detectados : {total}")
-    print(f"  TAE se activó          : {ae_on_count}  ({100 * ae_on_count  // total}%)")
-    print(f"  TAE no se activó       : {ae_off_count}  ({100 * ae_off_count // total}%)")
-    print(f"  Con mezcla lean        : {lean_count}  ({100 * lean_count    // total}%)")
+    print(f"  Transitorios sin cobertura TAE     : {len(events)}")
+    print(f"  Con mezcla lean (vs target MAP)    : {len(lean_events)}")
+    print(f"  TPSdot < tpsThresh (candidatos MAE): {len(mae_cand)}")
     print()
 
-    hdr = f"  {'SecL':>6}  {'ΔMAP':>5}  {'Pico':>5}  {'TPSdt':>6}  {'MAPdt':>6}  {'AE_PW':>5}  {'ΔAFR':>5}  Diagnóstico"
-    print(hdr)
-    print("  " + "─" * (len(hdr) - 2))
-    for e in sorted(events, key=lambda x: x['secl_start']):
-        ae_str  = f"{e['accel_pw_max']:.2f}" if e['ae_fired'] else "—"
-        afr_str = f"+{e['afr_delta']:.1f}" if e['afr_delta'] > 0.3 else "OK"
-        print(f"  {e['secl_start']:6.1f}  {e['map_rise']:5.1f}  {e['map_peak']:5.1f}"
-              f"  {e['tpsdot_max']:6.0f}  {e['mapdot_max']:6.0f}  {ae_str:>5}  {afr_str:>5}"
-              f"  {e['diagnosis']}")
+    if lean_events:
+        print(f"  {'SecL':>6}  {'ΔMAP':>5}  {'Pico':>5}  {'TPSdt':>6}  {'MAPdt':>6}  {'Lean/obj':>8}  Diagnóstico")
+        print("  " + "─" * 74)
+        shown = sorted(lean_events, key=lambda x: -x['lean_vs_target'])[:20]
+        for e in shown:
+            ls = f"+{e['lean_vs_target']:.1f}" if e['lean_vs_target'] > 0 else "OK"
+            print(f"  {e['secl_start']:6.1f}  {e['map_rise']:5.1f}  {e['map_peak']:5.1f}"
+                  f"  {e['tpsdot_max']:6.0f}  {e['mapdot_max']:6.0f}  {ls:>8}"
+                  f"  {e['diagnosis']}")
+        if len(lean_events) > 20:
+            print(f"  ... (+{len(lean_events)-20} eventos más)")
+        print()
 
-    # ── Evaluación TAE vs MAE ──
-    print()
-    print("── EVALUACIÓN TAE vs MAE " + "─" * 35)
+    # Siempre mostrar distribución MAPdot (útil incluso sin candidatos MAE puros)
+    if not mae_cand:
+        # Usar todos los eventos para la distribución
+        mae_cand = events
 
-    if tae_gap == 0:
-        print(f"  TAE (tpsThresh {tps_thresh:.0f} %/s) cubrió todos los eventos → OK.")
-    else:
-        pct   = 100 * tae_gap // total
-        gap_e = [e for e in events if not e['ae_fired'] and e['tpsdot_max'] < tps_thresh]
-        avg_mapdot  = _mean([e['mapdot_max'] for e in gap_e])
-        avg_maprise = _mean([e['map_rise']   for e in gap_e])
-        avg_lean    = _mean([e['afr_delta']  for e in gap_e])
-        print(f"  {tae_gap}/{total} eventos ({pct}%) no activaron TAE.")
-        print(f"  En esos eventos:")
-        print(f"    TPSdot máx promedio : {_mean([e['tpsdot_max'] for e in gap_e]):.0f} %/s "
-              f"(umbral actual: {tps_thresh:.0f} %/s)")
-        print(f"    MAPdot máx promedio : {avg_mapdot:.0f} kPa/s")
-        print(f"    Subida MAP promedio : {avg_maprise:.1f} kPa")
-        print(f"    Lean promedio       : +{avg_lean:.2f} AFR sobre baseline")
+    # ── Nota sobre "TPSdot ≥ tpsThresh pero sin AE" ──────────────
+    no_mae_pure = [e for e in events if e['tpsdot_max'] >= tps_thresh]
+    if no_mae_pure and not any(e['tpsdot_max'] < tps_thresh for e in events):
+        avg_tps_gap = _mean([e['tpsdot_max'] for e in no_mae_pure])
+        print(f"  Todos los eventos sin cobertura tienen TPSdot ≥ {tps_thresh:.0f} %/s.")
+        print(f"  TPSdot promedio: {avg_tps_gap:.0f} %/s — el ECU debería activar TAE.")
+        print(f"  Posibles causas:")
+        print(f"    · Filtro/debounce interno del ECU más agresivo que el log")
+        print(f"    · Bajar tpsThresh ({tps_thresh:.0f} → {max(5, int(tps_thresh*0.65)):.0f} %/s) da más margen")
+        print(f"    · MAE como respaldo MAPdot también cubre estos casos")
         print()
-        print("  ── Opciones de corrección ──────────────────────────────")
-        print()
-        print(f"  A) Bajar tpsThresh: {tps_thresh:.0f} → {max(5, tps_thresh * 0.6):.0f} %/s")
-        print("     Más sensible al movimiento de TPS, pero puede activar TAE")
-        print("     en cambios de carga pasivos (cuesta arriba sin mover el TPS).")
-        print()
-        print("  B) Activar MAE (MAPdot Acceleration Enrichment):")
-        print("     Fuel → Accel Enrichment → MAE Sensitivity")
-        if mae_rates and mae_bins:
-            all_zero = all((v or 0) == 0 for v in mae_bins)
-            print(f"     maeRates : {mae_rates}")
-            print(f"     maeBins  : {mae_bins}  {'← todos en 0, MAE desactivado' if all_zero else ''}")
-            if all_zero:
-                print("     Punto de partida sugerido: maeBins = [0.3, 0.8, 1.2, 1.5] ms")
-                print(f"     Ajusta con logs hasta que las celdas MAP={avg_maprise:.0f} kPa")
-                print("     dejen de aparecer lean en el análisis VE.")
+
+    # ── Distribución MAPdot para eventos candidatos MAE ──
+    print("── DISTRIBUCIÓN MAPdot EN EVENTOS SIN TAE ─────────────────")
+    mae_rate_vals = list(mae_rates or [15, 30, 60, 86])
+    bin_edges = [0] + mae_rate_vals
+    counts    = [0] * len(mae_rate_vals)
+    for e in mae_cand:
+        md = e['mapdot_max']
+        for k in range(len(mae_rate_vals) - 1, -1, -1):
+            if md >= bin_edges[k]:
+                counts[k] += 1
+                break
         else:
-            print("     maeRates/maeBins no encontrados en el MSQ.")
-        print()
-        print("  C) Blend MAE + TAE (recomendado para N/A con cuerpo lento):")
-        print("     TAE para aceleraciones fuertes (pedal rápido).")
-        print("     MAE para cargas lentas detectadas por MAPdot.")
-        print("     El blend % en TunerStudio permite priorizar uno u otro.")
+            counts[0] += 1
+    for k, rate in enumerate(mae_rate_vals):
+        bar = '█' * min(counts[k], 25)
+        lo  = int(bin_edges[k])
+        print(f"  MAPdot {lo:>3}–{int(rate):>3} kPa/s : {counts[k]:3d}  {bar}")
+    print()
+
+    avg_tpsdot = _mean([e['tpsdot_max']    for e in mae_cand])
+    avg_mapdot = _mean([e['mapdot_max']    for e in mae_cand])
+    avg_lean   = _mean([e['lean_vs_target'] for e in lean_events]) if lean_events else 0
+
+    print("── EVALUACIÓN ──────────────────────────────────────────────")
+    print(f"  TPSdot promedio en eventos sin TAE : {avg_tpsdot:.0f} %/s  (tpsThresh: {tps_thresh:.0f} %/s)")
+    print(f"  MAPdot promedio en esos eventos    : {avg_mapdot:.0f} kPa/s")
+    if lean_events:
+        print(f"  Lean promedio vs target            : +{avg_lean:.1f} AFR")
+    print()
+
+    # A) tpsThresh: solo sugerir si hay eventos donde tpsdot < tpsThresh
+    pure_mae = [e for e in events if e['tpsdot_max'] < tps_thresh]
+    if pure_mae:
+        avg_pure = _mean([e['tpsdot_max'] for e in pure_mae])
+        sug = max(5, int(avg_pure * 0.8))
+        print(f"  A) Bajar tpsThresh: {tps_thresh:.0f} → {sug} %/s")
+        print(f"     Capturaría los {len(pure_mae)} eventos con TPSdot ≈ {avg_pure:.0f} %/s.")
+        print(f"     Riesgo: AE en cargas pasivas (cuesta arriba sin mover el TPS).")
+    else:
+        sug = max(5, int(tps_thresh * 0.65))
+        print(f"  A) Bajar tpsThresh: {tps_thresh:.0f} → {sug} %/s  (más margen vs filtro ECU)")
+        print(f"     El ECU tiene filtro/debounce interno más agresivo que el log.")
+        print(f"     Reducir el umbral da margen para que el ECU active TAE antes.")
+    print()
+
+    print(f"  B) Activar / ajustar MAE (maeRates = sensibilidad al MAPdot):")
+    if mae_rates and mae_bins:
+        all_zero = all((v or 0) == 0 for v in mae_bins)
+        if all_zero:
+            print(f"     maeBins = {mae_bins}  ← MAE desactivado")
+            print(f"     maeRates = {mae_rates}")
+            print(f"     Punto de partida: maeBins = [0.3, 0.8, 1.2, 1.5] ms")
+            print(f"     Toma logs y ajusta hasta que las celdas MAP={int(avg_mapdot)} kPa/s")
+            print(f"     dejen de aparecer lean en el análisis VE.")
+        else:
+            print(f"     MAE configurado: maeRates={[int(r) for r in mae_rates]}")
+            print(f"                      maeBins ={mae_bins}")
+            print(f"     Si el AE Type en TunerStudio está en 'TPS only', MAE no aplica.")
+            print(f"     Cambia a 'MAP+TPS blend' para que maeBins entre en efecto.")
+            print(f"     Con MAPdot típico de {int(avg_mapdot)} kPa/s los bins actuales")
+            print(f"     podrían ser suficientes — prueba primero habilitando el blend.")
+    else:
+        print(f"     maeRates/maeBins no encontrados en el MSQ.")
+    print()
+    print(f"  C) Blend MAE + TAE (recomendado para N/A con cuerpo lento):")
+    print(f"     TAE cubre aceleraciones de pedal (TPSdot alto).")
+    print(f"     MAE cubre subidas de carga lentas (MAPdot sin TPSdot).")
 
 
 # ─────────────────────────────────────────────
