@@ -256,8 +256,8 @@ def load_ae_config(msq_path: str) -> dict:
 
 
 _POST_AE_COOLDOWN_SECS = 1.5   # segundos de mezcla inestable tras apagarse el AE
-_MAP_HISTORY_SECS      = 2.0   # ventana para detectar reversión de MAP
-_MAP_REVERT_KPA        = 4.0   # si MAP cayó >4 kPa desde su pico en la ventana → transitorio
+_MAP_HISTORY_SECS      = 2.0   # ventana temporal del historial MAP
+_MAP_STABILITY_KPA     = 5.0   # rango máximo (max-min) admitido en la ventana; más → transitorio
 
 
 def load_msl_logs(log_files: list, include_idle: bool = False) -> list:
@@ -320,8 +320,8 @@ def load_msl_logs(log_files: list, include_idle: bool = False) -> list:
                 while _mh and secl_val - _mh[0][0] > _MAP_HISTORY_SECS:
                     _mh.popleft()
                 if len(_mh) >= 2:
-                    _peak = max(m for _, m in _mh)
-                    if _peak - map_val > _MAP_REVERT_KPA and _peak - _mh[0][1] > _MAP_REVERT_KPA:
+                    _map_vals = [m for _, m in _mh]
+                    if max(_map_vals) - min(_map_vals) > _MAP_STABILITY_KPA:
                         continue
                 all_rows.append({
                     'rpm':      rpm,
@@ -427,8 +427,8 @@ def load_msl_logs(log_files: list, include_idle: bool = False) -> list:
             while _mh and _secl - _mh[0][0] > _MAP_HISTORY_SECS:
                 _mh.popleft()
             if len(_mh) >= 2:
-                _peak = max(m for _, m in _mh)
-                if _peak - _mval > _MAP_REVERT_KPA and _peak - _mh[0][1] > _MAP_REVERT_KPA:
+                _map_vals = [m for _, m in _mh]
+                if max(_map_vals) - min(_map_vals) > _MAP_STABILITY_KPA:
                     continue
             row['file_idx'] = fi
             all_rows.append(row)
