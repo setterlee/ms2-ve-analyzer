@@ -3605,6 +3605,324 @@ def print_map_transient_events(events: list, ae_cfg: dict,
 
 
 # ─────────────────────────────────────────────
+# 7b. CALIBRACIÓN WOT (plena carga — sección independiente)
+# ─────────────────────────────────────────────
+
+_WOT_TPS_THRESH     = 85.0   # % TPS mínimo para considerar "plena carga"
+_WOT_MIN_RPM        = 1500   # rpm mínimo — evita arranque/ralentí alto
+_WOT_MIN_PULL_SECS  = 2.0    # duración mínima de un tramo para contarlo como "pull"
+_WOT_LEAN_DELTA_AFR = 0.3    # desvío AFR real-objetivo para marcar celda "pobre"
+_WOT_RICH_DELTA_AFR = 0.3    # ídem para "rica"
+
+
+def load_wot_rows(log_files: list, tps_thresh: float = _WOT_TPS_THRESH) -> list:
+    """
+    Parsea logs .msl/.mlg capturando frames de plena carga (WOT) SIN aplicar
+    los filtros de estabilidad de crucero (rango de MAT, estabilidad de MAP,
+    límites de mapdot/rpmdot) que usa load_msl_logs.
+
+    Esos filtros existen para aislar celdas en condición estacionaria — pero
+    en un pull de WOT el MAP sube con fuerza y el motor barre el rango de RPM
+    rápidamente: son exactamente la condición que se quiere calibrar, no
+    "ruido" a descartar. Aplicarlos descarta el tramo de interés completo
+    (p.ej. un MAT de invierno fuera del rango [38-58°C] excluye el log
+    entero sin avisar — justo lo que le pasó a este analizador).
+
+    Conserva: motor caliente, AFR válido, TPS ≥ tps_thresh, sin AE activo y
+    fuera del breve período de asentamiento posterior al AE (la mezcla tarda
+    ~1.5 s en estabilizarse tras apagarse el enriquecimiento).
+    """
+    all_rows = []
+    _last_ae_secl: dict = {}
+    for fi, fname in enumerate(log_files):
+        with open(fname, 'rb') as fh:
+            raw = fh.read()
+
+        # ── MLG ──────────────────────────────────────────────────
+        if raw.startswith(_MLG_MAGIC):
+            channels, data_start = _mlg_parse_header(raw)
+            if channels is None or data_start is None:
+                continue
+            for row_raw in _mlg_iter_records(raw, channels, data_start):
+                rpm      = row_raw.get('RPM', 0)
+                afr      = row_raw.get('AFR', 0)
+                clt      = row_raw.get('CLT', 0)
+                tps      = row_raw.get('TPS', 0)
+                accel_pw = row_raw.get('Accel PW', 0)
+                secl_val = row_raw.get('SecL', 0) or 0
+                if rpm < _WOT_MIN_RPM or not (8.0 < afr < 20.0) or clt < 70:
+                    continue
+                if tps < tps_thresh:
+                    continue
+                if accel_pw > 0.05:
+                    _last_ae_secl[fi] = secl_val
+                    continue
+                if secl_val - _last_ae_secl.get(fi, -9999) < _POST_AE_COOLDOWN_SECS:
+                    continue
+                all_rows.append({
+                    'rpm':      rpm,
+                    'map':      row_raw.get('MAP', 0),
+                    'afr':      afr,
+                    'tps':      tps,
+                    'clt':      clt,
+                    'mat':      row_raw.get('MAT'),
+                    'tpsdot':   row_raw.get('TPSdot', 0),
+                    'mapdot':   row_raw.get('MAPdot', 0),
+                    'rpmdot':   row_raw.get('RPMdot', 0),
+                    'accel_pw': accel_pw,
+                    'ego_cor':  row_raw.get('EGO cor1', 100.0),
+                    'afr_tgt':  row_raw.get('AFR Target 1'),
+                    'secl':     secl_val,
+                    'batt_v':   row_raw.get('Batt V'),
+                    'pw':       row_raw.get('PW'),
+                    'file_idx': fi,
+                })
+            continue
+
+        # ── MSL ──────────────────────────────────────────────────
+        text_start = raw.find(b'Time')
+        if text_start < 0:
+            continue
+        text  = raw[text_start:].decode('latin-1', errors='replace')
+        lines = text.split('\n')
+        if len(lines) < 3:
+            continue
+        headers = lines[0].strip().split('\t')
+        cols    = {h.strip(): i for i, h in enumerate(headers)}
+        if any(c not in cols for c in ('RPM', 'MAP', 'AFR', 'TPS', 'CLT')):
+            continue
+
+        for line in lines[2:]:
+            parts = line.strip().split('\t')
+            if len(parts) < 10:
+                continue
+            try:
+                rpm = float(parts[cols['RPM']])
+                afr = float(parts[cols['AFR']])
+                tps = float(parts[cols['TPS']])
+                clt = float(parts[cols['CLT']])
+            except (ValueError, IndexError):
+                continue
+            if rpm < _WOT_MIN_RPM or not (8.0 < afr < 20.0) or clt < 70:
+                continue
+            if tps < tps_thresh:
+                continue
+            try:
+                accel_pw = float(parts[cols['Accel PW']]) if 'Accel PW' in cols else 0.0
+                secl_val = float(parts[cols['SecL']])     if 'SecL'     in cols else 0.0
+            except (ValueError, IndexError):
+                continue
+            if accel_pw > 0.05:
+                _last_ae_secl[fi] = secl_val
+                continue
+            if secl_val - _last_ae_secl.get(fi, -9999) < _POST_AE_COOLDOWN_SECS:
+                continue
+            try:
+                row = {
+                    'rpm': rpm, 'map': float(parts[cols['MAP']]), 'afr': afr,
+                    'tps': tps, 'clt': clt,
+                    'mat':      float(parts[cols['MAT']])          if 'MAT'          in cols else None,
+                    'tpsdot':   float(parts[cols['TPSdot']])       if 'TPSdot'       in cols else 0.0,
+                    'mapdot':   float(parts[cols['MAPdot']])       if 'MAPdot'       in cols else 0.0,
+                    'rpmdot':   float(parts[cols['RPMdot']])       if 'RPMdot'       in cols else 0.0,
+                    'accel_pw': accel_pw,
+                    'ego_cor':  float(parts[cols['EGO cor1']])     if 'EGO cor1'     in cols else 100.0,
+                    'afr_tgt':  float(parts[cols['AFR Target 1']]) if 'AFR Target 1' in cols else None,
+                    'secl':     secl_val,
+                    'batt_v':   float(parts[cols['Batt V']])       if 'Batt V'       in cols else None,
+                    'pw':       float(parts[cols['PW']])           if 'PW'           in cols else None,
+                    'file_idx': fi,
+                }
+            except (ValueError, IndexError):
+                continue
+            all_rows.append(row)
+
+    return all_rows
+
+
+def detect_wot_pulls(rows: list, min_duration_secs: float = _WOT_MIN_PULL_SECS) -> list:
+    """Agrupa filas WOT consecutivas (mismo archivo, gap de SecL ≤ 1.5 s) en 'pulls'."""
+    if not rows:
+        return []
+    rows_s = sorted(rows, key=lambda r: (r.get('file_idx', 0), r.get('secl', 0) or 0))
+    groups = []
+    g = [rows_s[0]]
+    for i in range(1, len(rows_s)):
+        prev, cur = rows_s[i - 1], rows_s[i]
+        if cur.get('file_idx', 0) == prev.get('file_idx', 0) and \
+           (cur.get('secl', 0) or 0) - (prev.get('secl', 0) or 0) <= 1.5:
+            g.append(cur)
+        else:
+            groups.append(g)
+            g = [cur]
+    groups.append(g)
+
+    pulls = []
+    for g in groups:
+        secs = sorted({r.get('secl', 0) or 0 for r in g})
+        duration = secs[-1] - secs[0]
+        if duration < min_duration_secs:
+            continue
+        rpms  = [r['rpm'] for r in g]
+        afrs  = [r['afr'] for r in g]
+        diffs = [r['afr'] - r['afr_tgt'] for r in g if r.get('afr_tgt') is not None]
+        tgts  = [r['afr_tgt'] for r in g if r.get('afr_tgt') is not None]
+        pulls.append({
+            'file_idx':    g[0].get('file_idx', 0),
+            'secl_start':  secs[0],
+            'secl_end':    secs[-1],
+            'duration':    duration,
+            'n':           len(g),
+            'rpm_start':   rpms[0],
+            'rpm_end':     rpms[-1],
+            'afr_avg':     sum(afrs) / len(afrs),
+            'afr_tgt_avg': sum(tgts) / len(tgts) if tgts else None,
+            'lean_avg':    sum(diffs) / len(diffs) if diffs else None,
+            'lean_max':    max(diffs) if diffs else None,
+        })
+    return pulls
+
+
+def analyze_wot_calibration(rows: list, ve_data: dict, min_samples: int = 3) -> dict:
+    """
+    Corrección de VE específica para celdas alcanzadas en WOT (plena carga).
+
+    Dos diferencias clave frente a analyze():
+    1. Clasifica pobre/rica RELATIVO al AFR objetivo de cada celda, no con
+       los umbrales absolutos de crucero (~14.2-14.5 / ~13.0): a plena carga
+       el objetivo ronda 12.5-13.0, así que un AFR real de 13.8 ya es ~1
+       punto más pobre que el objetivo aunque esté lejos de 14.5.
+    2. No aplica _dwell_filter: durante un pull el motor atraviesa cada
+       celda en 1-2 s — exigir 2 s continuos descartaría casi todo el dato.
+    """
+    rpm_bins = ve_data['rpm_bins']
+    map_bins = ve_data['map_bins']
+    ve       = ve_data['ve']
+
+    cell_samples: dict = {}
+    for row in rows:
+        mi = find_bin(row['map'], map_bins)
+        ri = find_bin(row['rpm'], rpm_bins)
+        cell_samples.setdefault((mi, ri), []).append(row)
+
+    lean_cells, rich_cells, ok_cells = [], [], []
+    for (mi, ri), samples in sorted(cell_samples.items()):
+        m, r = map_bins[mi], rpm_bins[ri]
+        if len(samples) < min_samples:
+            continue
+
+        afrs = sorted(s['afr'] for s in samples)
+        mid  = len(afrs) // 2
+        avg  = (afrs[mid - 1] + afrs[mid]) / 2 if len(afrs) % 2 == 0 else afrs[mid]
+
+        tgt_vals = [s['afr_tgt'] for s in samples if s.get('afr_tgt') is not None]
+        if tgt_vals:
+            tv = sorted(tgt_vals)
+            tm = len(tv) // 2
+            tgt = (tv[tm - 1] + tv[tm]) / 2 if len(tv) % 2 == 0 else tv[tm]
+        else:
+            tgt = target_afr(m)
+
+        vc = ve[mi][ri]
+        raw_delta = vc * avg / tgt - vc
+        MAX_DELTA = 10
+        delta = max(-MAX_DELTA, min(MAX_DELTA, round(raw_delta)))
+        vn    = round(vc) + delta
+
+        secs = sorted({s.get('secl', 0) or 0 for s in samples})
+        entry = {
+            'mi': mi, 'ri': ri, 'map': m, 'rpm': r,
+            'afr_avg': avg, 'target': tgt, 'n': len(afrs), 'n_secs': len(secs),
+            've_cur': vc, 've_new': vn, 'delta': delta,
+        }
+
+        diff = avg - tgt
+        if diff > _WOT_LEAN_DELTA_AFR:
+            lean_cells.append(entry)
+        elif diff < -_WOT_RICH_DELTA_AFR:
+            rich_cells.append(entry)
+        else:
+            ok_cells.append(entry)
+
+    return {
+        'lean':    lean_cells,
+        'rich':    rich_cells,
+        'ok':      ok_cells,
+        'n_rows':  len(rows),
+        'n_cells': len(cell_samples),
+    }
+
+
+def print_wot_calibration(result: dict, pulls: list, tps_thresh: float = _WOT_TPS_THRESH) -> None:
+    lean = result['lean']
+    rich = result['rich']
+    ok   = result['ok']
+
+    print()
+    print("═" * 70)
+    print("  CALIBRACIÓN WOT (plena carga) — sección independiente")
+    print("═" * 70)
+    print(f"  Umbral TPS considerado WOT  : ≥ {tps_thresh:.0f}%")
+    print(f"  Pulls de WOT detectados     : {len(pulls)}")
+    print(f"  Filas WOT analizadas        : {result['n_rows']:,}")
+    print(f"  Celdas con datos suficientes: {result['n_cells']}")
+    print(f"  Celdas POBRES               : {len(lean)}")
+    print(f"  Celdas RICAS                : {len(rich)}")
+    print(f"  Celdas OK                   : {len(ok)}")
+    print()
+    print("  Esta sección IGNORA los filtros de MAT, estabilidad de MAP y")
+    print("  mapdot/rpmdot del análisis VE de crucero — en un pull de WOT esas")
+    print("  variaciones SON la condición a calibrar, no ruido a descartar.")
+    print("  La clasificación pobre/rica es relativa al AFR objetivo de cada")
+    print(f"  celda (no a los umbrales de crucero): un desvío de ±{_WOT_LEAN_DELTA_AFR:.1f} AFR")
+    print("  ya es señal de corrección a esta carga.")
+
+    if pulls:
+        print()
+        print("  ── PULLS DETECTADOS ──")
+        print(f"  {'#':>3}  {'arch':>4}  {'SecL':>11}  {'dur':>5}  {'RPM':>13}  "
+              f"{'AFR prom':>9}  {'obj prom':>9}  {'Δ prom':>7}  {'Δ máx':>7}")
+        for i, p in enumerate(pulls, 1):
+            secl_r = f"{p['secl_start']:.0f}-{p['secl_end']:.0f}"
+            rpm_r  = f"{p['rpm_start']:.0f}→{p['rpm_end']:.0f}"
+            tgt_s  = f"{p['afr_tgt_avg']:.2f}" if p['afr_tgt_avg'] is not None else "  -  "
+            lean_s = f"{p['lean_avg']:+.2f}"   if p['lean_avg']   is not None else "  -  "
+            leax_s = f"{p['lean_max']:+.2f}"   if p['lean_max']   is not None else "  -  "
+            print(f"  {i:3d}  {p['file_idx']:4d}  {secl_r:>11}  {p['duration']:4.1f}s  "
+                  f"{rpm_r:>13}  {p['afr_avg']:9.2f}  {tgt_s:>9}  {lean_s:>7}  {leax_s:>7}")
+
+    if not lean and not rich:
+        print()
+        print("  ✓ Sin celdas WOT fuera de objetivo (con los datos disponibles).")
+        if result['n_rows'] == 0:
+            print("  ⚠ No se encontraron filas de WOT — verifica que algún tramo del")
+            print(f"    log supere TPS ≥ {tps_thresh:.0f}% con el motor caliente (CLT > 70°C).")
+        return
+
+    def _table(cells, title, sort_key, reverse):
+        print()
+        print(f"  ── {title} ──")
+        print(f"  {'MAP':>5}  {'RPM':>5}  {'AFR real':>9}  {'objetivo':>9}  "
+              f"{'Δ AFR':>7}  {'n':>5}  {'VE actual':>10}  {'VE sug.':>8}  {'Δ VE':>6}")
+        for c in sorted(cells, key=sort_key, reverse=reverse):
+            print(f"  {c['map']:5.0f}  {c['rpm']:5.0f}  {c['afr_avg']:9.2f}  {c['target']:9.2f}  "
+                  f"{c['afr_avg'] - c['target']:+7.2f}  {c['n']:5d}  "
+                  f"{c['ve_cur']:10.0f}  {c['ve_new']:8.0f}  {c['delta']:+6d}")
+
+    if lean:
+        _table(lean, "CELDAS POBRES (AFR real > objetivo)",
+               lambda x: x['afr_avg'] - x['target'], True)
+    if rich:
+        _table(rich, "CELDAS RICAS (AFR real < objetivo)",
+               lambda x: x['afr_avg'] - x['target'], False)
+
+    print()
+    print("  Recordatorio: estas sugerencias de VE son orientativas — confirma")
+    print("  con varios pulls bajo distintas condiciones antes de aplicar")
+    print("  cambios definitivos a la tabla.")
+
+
+# ─────────────────────────────────────────────
 # 6. SELECCIÓN INTERACTIVA (renumerado)
 # ─────────────────────────────────────────────
 

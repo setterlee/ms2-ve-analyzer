@@ -54,6 +54,7 @@ from ve_analyzer import (
     detect_ae_events, analyze_ae_calibration, print_ae_calibration,
     detect_map_transient_events, print_map_transient_events,
     detect_stall_events, print_stall_events,
+    load_wot_rows, detect_wot_pulls, analyze_wot_calibration, print_wot_calibration,
     print_report, print_effectiveness, print_cell_detail,
 )
 
@@ -275,6 +276,10 @@ class VEAnalyzerApp:
                                    command=self._run_ae_cal)
         self._btn_ae.pack(fill=tk.X, pady=2)
 
+        self._btn_wot = ttk.Button(a, text="Calibrar WOT",
+                                   command=self._run_wot_cal)
+        self._btn_wot.pack(fill=tk.X, pady=2)
+
         ttk.Separator(a).pack(fill=tk.X, pady=5)
 
         self._btn_smooth = ttk.Button(a, text="Suavizar tabla VE",
@@ -324,6 +329,11 @@ class VEAnalyzerApp:
             self._nb, state='disabled', wrap=tk.WORD,
             font=('Courier', 10))
         self._nb.add(self._txt_ae, text="AE")
+
+        self._txt_wot = scrolledtext.ScrolledText(
+            self._nb, state='disabled', wrap=tk.WORD,
+            font=('Courier', 10))
+        self._nb.add(self._txt_wot, text="WOT")
 
         self._txt_log = scrolledtext.ScrolledText(
             self._nb, state='disabled', wrap=tk.NONE,
@@ -679,6 +689,49 @@ class VEAnalyzerApp:
         self._run_in_thread(_do, lambda: (
             self._lock(False),
             self._status.set("Calibración AE completada.")
+        ))
+
+    # ── Calibración WOT (plena carga) ────────────────────────────────────────
+
+    def _run_wot_cal(self):
+        if not self._validate():
+            return
+        self._lock(True)
+        self._status.set("Analizando WOT (plena carga)…")
+
+        def _do():
+            msq  = self._msq_path.get()
+            tnum = self._table_num.get()
+            proj = self._project_dir.get() or str(Path(msq).parent)
+
+            print(f"Cargando VE tabla {tnum} desde {Path(msq).name}…")
+            ve_data = load_ve_table(msq, table_num=tnum, project_dir=proj)
+
+            print(f"Cargando {len(self._log_files)} log(s) — solo tramos WOT…")
+            rows = load_wot_rows(self._log_files)
+            print(f"  {len(rows):,} filas de WOT (sin filtros de crucero).")
+
+            print("Detectando pulls de WOT…")
+            pulls = detect_wot_pulls(rows)
+            print(f"  {len(pulls)} pull(s) de WOT detectado(s).")
+
+            print("Analizando celdas alcanzadas en WOT…")
+            result = analyze_wot_calibration(rows, ve_data)
+
+            buf = io.StringIO()
+            old = sys.stdout; sys.stdout = buf
+            print_wot_calibration(result, pulls)
+            sys.stdout = old
+
+            rpt = buf.getvalue()
+            self.root.after(0, lambda r=rpt: (
+                self._set_txt(self._txt_wot, r),
+                self._nb.select(self._txt_wot)
+            ))
+
+        self._run_in_thread(_do, lambda: (
+            self._lock(False),
+            self._status.set("Calibración WOT completada.")
         ))
 
     # ── Suavizar tabla ───────────────────────────────────────────────────────
