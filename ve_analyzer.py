@@ -3614,6 +3614,19 @@ _WOT_MIN_PULL_SECS  = 2.0    # duración mínima de un tramo para contarlo como 
 _WOT_LEAN_DELTA_AFR = 0.3    # desvío AFR real-objetivo para marcar celda "pobre"
 _WOT_RICH_DELTA_AFR = 0.3    # ídem para "rica"
 
+# Umbrales para el diagnóstico de salud específico de WOT (sección 7c).
+# Son pisos orientativos para un 4G15 N/A — no reemplazan el manual del
+# fabricante, pero permiten detectar condiciones claramente anormales.
+_WOT_OIL_WARN_PSI    = 25.0  # presión de aceite mínima esperable en plena carga
+_WOT_OIL_CRIT_PSI    = 15.0  # por debajo de esto: riesgo real de daño a rodamientos
+_WOT_OIL_SAG_PSI     = 8.0   # caída aceite (rpm baja→alta) que amerita revisión
+_WOT_FP_SAG_PSI      = 5.0   # caída de presión de combustible bajo demanda creciente
+_WOT_DC_WARN_PCT     = 85.0  # duty cycle de inyectores cerca del límite
+_WOT_DC_CRIT_PCT     = 95.0  # duty cycle prácticamente saturado — VE ya no alcanza
+_WOT_VOLT_WARN       = 13.0  # voltaje bajo carga — alternador al límite
+_WOT_VOLT_CRIT       = 12.5  # voltaje bajo carga — crítico (afecta dwell/inyección)
+_WOT_MAT_RISE_WARN   = 8.0   # °C de aumento de MAT dentro de un mismo pull (heat-soak)
+
 
 def load_wot_rows(log_files: list, tps_thresh: float = _WOT_TPS_THRESH) -> list:
     """
@@ -3660,22 +3673,30 @@ def load_wot_rows(log_files: list, tps_thresh: float = _WOT_TPS_THRESH) -> list:
                 if secl_val - _last_ae_secl.get(fi, -9999) < _POST_AE_COOLDOWN_SECS:
                     continue
                 all_rows.append({
-                    'rpm':      rpm,
-                    'map':      row_raw.get('MAP', 0),
-                    'afr':      afr,
-                    'tps':      tps,
-                    'clt':      clt,
-                    'mat':      row_raw.get('MAT'),
-                    'tpsdot':   row_raw.get('TPSdot', 0),
-                    'mapdot':   row_raw.get('MAPdot', 0),
-                    'rpmdot':   row_raw.get('RPMdot', 0),
-                    'accel_pw': accel_pw,
-                    'ego_cor':  row_raw.get('EGO cor1', 100.0),
-                    'afr_tgt':  row_raw.get('AFR Target 1'),
-                    'secl':     secl_val,
-                    'batt_v':   row_raw.get('Batt V'),
-                    'pw':       row_raw.get('PW'),
-                    'file_idx': fi,
+                    'rpm':           rpm,
+                    'map':           row_raw.get('MAP', 0),
+                    'afr':           afr,
+                    'tps':           tps,
+                    'clt':           clt,
+                    'mat':           row_raw.get('MAT'),
+                    'tpsdot':        row_raw.get('TPSdot', 0),
+                    'mapdot':        row_raw.get('MAPdot', 0),
+                    'rpmdot':        row_raw.get('RPMdot', 0),
+                    'accel_pw':      accel_pw,
+                    'ego_cor':       row_raw.get('EGO cor1', 100.0),
+                    'afr_tgt':       row_raw.get('AFR Target 1'),
+                    'secl':          secl_val,
+                    'batt_v':        row_raw.get('Batt V'),
+                    'pw':            row_raw.get('PW'),
+                    'oil_pressure':  row_raw.get('OilPressure'),
+                    'fuel_pressure': row_raw.get('fuel_pressure'),
+                    'knock_retard':  row_raw.get('SPK: Knock retard'),
+                    'duty_cycle':    row_raw.get('DutyCycle1'),
+                    'dwell':         row_raw.get('Dwell'),
+                    'baro':          row_raw.get('Barometer'),
+                    'adv':           row_raw.get('SPK: Spark Advance'),
+                    'mat_retard':    row_raw.get('SPK: MAT Retard'),
+                    'file_idx':      fi,
                 })
             continue
 
@@ -3731,6 +3752,14 @@ def load_wot_rows(log_files: list, tps_thresh: float = _WOT_TPS_THRESH) -> list:
                     'secl':     secl_val,
                     'batt_v':   float(parts[cols['Batt V']])       if 'Batt V'       in cols else None,
                     'pw':       float(parts[cols['PW']])           if 'PW'           in cols else None,
+                    'oil_pressure':  float(parts[cols['OilPressure']])         if 'OilPressure'         in cols else None,
+                    'fuel_pressure': float(parts[cols['fuel_pressure']])       if 'fuel_pressure'       in cols else None,
+                    'knock_retard':  float(parts[cols['SPK: Knock retard']])   if 'SPK: Knock retard'   in cols else None,
+                    'duty_cycle':    float(parts[cols['DutyCycle1']])          if 'DutyCycle1'          in cols else None,
+                    'dwell':         float(parts[cols['Dwell']])               if 'Dwell'               in cols else None,
+                    'baro':          float(parts[cols['Barometer']])           if 'Barometer'           in cols else None,
+                    'adv':           float(parts[cols['SPK: Spark Advance']])  if 'SPK: Spark Advance'  in cols else None,
+                    'mat_retard':    float(parts[cols['SPK: MAT Retard']])     if 'SPK: MAT Retard'     in cols else None,
                     'file_idx': fi,
                 }
             except (ValueError, IndexError):
@@ -3920,6 +3949,300 @@ def print_wot_calibration(result: dict, pulls: list, tps_thresh: float = _WOT_TP
     print("  Recordatorio: estas sugerencias de VE son orientativas — confirma")
     print("  con varios pulls bajo distintas condiciones antes de aplicar")
     print("  cambios definitivos a la tabla.")
+
+
+def _pressure_profile(rows: list, key: str, valid_range: tuple) -> dict | None:
+    """
+    Compara la presión (aceite o combustible) entre la mitad de menor RPM y
+    la mitad de mayor RPM dentro del rango de WOT observado.
+
+    Por qué RPM y no tiempo: en un pull, la RPM es un proxy directo de la
+    demanda — más RPM = más caudal de aceite requerido por el motor y más
+    caudal de combustible exigido a la bomba/regulador. Una presión que cae
+    justo cuando la demanda sube ('sag') es la firma clásica de una bomba al
+    límite, un filtro restringido, o (en aceite) un pickup que se descubre.
+    Retorna None si no hay sensor o hay muy pocos datos válidos.
+    """
+    pts = sorted(((r['rpm'], r[key]) for r in rows
+                  if r.get(key) is not None and valid_range[0] < r[key] < valid_range[1]),
+                 key=lambda x: x[0])
+    if len(pts) < 20:
+        return None
+
+    mid = len(pts) // 2
+    lo, hi = pts[:mid], pts[mid:]
+    rpm_lo, val_lo = [r for r, _ in lo], [v for _, v in lo]
+    rpm_hi, val_hi = [r for r, _ in hi], [v for _, v in hi]
+    vals = [v for _, v in pts]
+    return {
+        'n':          len(pts),
+        'avg':        _mean(vals),
+        'min':        min(vals),
+        'max':        max(vals),
+        'rpm_lo_avg': _mean(rpm_lo),
+        'rpm_hi_avg': _mean(rpm_hi),
+        'val_lo_rpm': _mean(val_lo),
+        'val_hi_rpm': _mean(val_hi),
+        'sag':        _mean(val_lo) - _mean(val_hi),   # positivo = la presión cae al subir RPM
+    }
+
+
+def analyze_wot_health(rows: list, pulls: list) -> dict:
+    """
+    Diagnóstico de salud calculado SOLO con las filas de WOT (plena carga) —
+    la condición de mayor exigencia mecánica y eléctrica del motor, y la que
+    más rápido expone problemas marginales que en crucero pasan inadvertidos:
+    presión de aceite o combustible que no sostienen el caudal bajo demanda,
+    detonación, inyectores saturados, caída de voltaje, heat-soak de admisión.
+
+    A diferencia de analyze_health() (panorama general del motor en todo el
+    log), aquí cada métrica se aísla a la ventana de WOT — mezclar esas filas
+    con ralentí o crucero diluiría justo las señales que interesa ver.
+    """
+    n = len(rows)
+    health: dict = {'n_rows': n}
+    if n == 0:
+        return health
+
+    def fv(key):
+        return [r[key] for r in rows if r.get(key) is not None]
+
+    # ── Presión de aceite y de combustible: ¿se sostienen al subir la demanda? ──
+    health['oil_pressure']  = _pressure_profile(rows, 'oil_pressure',  (5, 150))
+    health['fuel_pressure'] = _pressure_profile(rows, 'fuel_pressure', (5, 150))
+
+    # ── Detonación — cualquier evento bajo carga máxima merece atención ──
+    knock = fv('knock_retard')
+    health['knock'] = {
+        'has_sensor': len(knock) > 0,
+        'events':     sum(1 for v in knock if v > 0),
+        'max':        max(knock) if knock else 0,
+    }
+
+    # ── Saturación de inyectores: si el duty cycle ronda el límite, el motor ──
+    # ── ya no puede recibir más combustible aunque la tabla VE lo pida       ──
+    dc = fv('duty_cycle')
+    health['injectors'] = {
+        'has_sensor':     len(dc) > 0,
+        'avg':            _mean(dc),
+        'max':            max(dc) if dc else 0,
+        'above_warn_pct': _pct(sum(1 for v in dc if v > _WOT_DC_WARN_PCT), len(dc)),
+        'above_crit_pct': _pct(sum(1 for v in dc if v > _WOT_DC_CRIT_PCT), len(dc)),
+    }
+
+    # ── Voltaje bajo la mayor exigencia eléctrica (bomba + ignición a alta RPM) ──
+    batt = [v for v in fv('batt_v') if 5 < v < 30]
+    health['voltage'] = {
+        'has_sensor': len(batt) > 0,
+        'avg':        _mean(batt),
+        'min':        min(batt) if batt else None,
+        'below_warn': sum(1 for v in batt if v < _WOT_VOLT_WARN),
+        'below_crit': sum(1 for v in batt if v < _WOT_VOLT_CRIT),
+    }
+
+    # ── Heat-soak: ¿sube la MAT de forma sostenida dentro de un mismo pull? ──
+    rises = []
+    for p in pulls:
+        prows = [r for r in rows
+                 if r.get('file_idx') == p['file_idx']
+                 and p['secl_start'] <= (r.get('secl') or -1) <= p['secl_end']]
+        mats = [r['mat'] for r in prows if r.get('mat') is not None]
+        if len(mats) >= 3:
+            rises.append(max(mats) - min(mats))
+    health['heat_soak'] = {
+        'n_pulls':  len(rises),
+        'max_rise': max(rises) if rises else None,
+        'avg_rise': _mean(rises) if rises else None,
+    }
+
+    # ── Dwell de bobina bajo carga (chispa débil pasa inadvertida en ralentí) ──
+    dwell = [v for v in fv('dwell') if v > 0]
+    health['dwell'] = {
+        'has_sensor': len(dwell) > 0,
+        'avg':        _mean(dwell),
+        'min':        min(dwell) if dwell else None,
+        'below_2':    sum(1 for v in dwell if v < 2.0),
+    }
+
+    return health
+
+
+def print_wot_health(health: dict) -> None:
+    if health.get('n_rows', 0) == 0:
+        return
+
+    def row(*parts):
+        print('  ' + '  '.join(str(p) for p in parts))
+
+    def note(text):
+        print(f"  → {text}")
+
+    def sec(title):
+        print(f"\n  ── {title} ──")
+
+    print()
+    print("─" * 70)
+    print("  SALUD DEL MOTOR EN WOT (plena carga)")
+    print("─" * 70)
+    print("  Cada métrica se calcula SOLO con las filas de WOT — son las")
+    print("  condiciones de mayor exigencia mecánica y eléctrica, y las que")
+    print("  más rápido revelan problemas que en crucero pasan inadvertidos.")
+    print("  Los umbrales son pisos orientativos para un 4G15 N/A, no specs")
+    print("  de fábrica: úsalos para decidir qué revisar, no como veredicto final.")
+
+    any_critical = False
+
+    # ── Presión de aceite ──
+    sec('Presión de aceite')
+    op = health['oil_pressure']
+    if op:
+        crit     = op['min'] < _WOT_OIL_CRIT_PSI
+        warn     = (not crit) and op['min'] < _WOT_OIL_WARN_PSI
+        sag_warn = op['sag'] > _WOT_OIL_SAG_PSI
+        row(f"Prom: {op['avg']:.1f} PSI   Mín: {op['min']:.1f} PSI   Máx: {op['max']:.1f} PSI"
+            f"   (n={op['n']:,})")
+        row(f"A ~{op['rpm_lo_avg']:.0f} rpm: {op['val_lo_rpm']:.1f} PSI   →   "
+            f"a ~{op['rpm_hi_avg']:.0f} rpm: {op['val_hi_rpm']:.1f} PSI"
+            f"   (Δ {-op['sag']:+.1f} PSI)")
+        if crit:
+            any_critical = True
+            row(f"⚠ CRÍTICO: mínimo {op['min']:.1f} PSI — bajo el piso orientativo de "
+                f"{_WOT_OIL_CRIT_PSI:.0f} PSI en plena carga")
+            note("Riesgo real de daño a rodamientos — revisa bomba, filtro/colador, "
+                 "nivel y viscosidad de aceite antes de seguir exigiendo el motor")
+        elif warn:
+            row(f"⚠ REVISAR: mínimo {op['min']:.1f} PSI — bajo el piso orientativo de "
+                f"{_WOT_OIL_WARN_PSI:.0f} PSI")
+        else:
+            row(f"✓ Se mantiene sobre {_WOT_OIL_WARN_PSI:.0f} PSI durante la plena carga")
+        if sag_warn:
+            row(f"⚠ La presión cae {op['sag']:.1f} PSI al subir de "
+                f"~{op['rpm_lo_avg']:.0f} a ~{op['rpm_hi_avg']:.0f} rpm")
+            note("Una bomba sana sostiene o sube la presión con la RPM — una caída "
+                 "sugiere bomba desgastada, aireación del aceite o nivel bajo")
+    else:
+        row("Sin sensor OilPressure en el log — no se puede evaluar")
+
+    # ── Presión de combustible ──
+    sec('Presión de combustible')
+    fp = health['fuel_pressure']
+    if fp:
+        sag_crit = fp['sag'] > _WOT_FP_SAG_PSI
+        row(f"Prom: {fp['avg']:.1f} PSI   Mín: {fp['min']:.1f} PSI   Máx: {fp['max']:.1f} PSI"
+            f"   (n={fp['n']:,})")
+        row(f"A ~{fp['rpm_lo_avg']:.0f} rpm: {fp['val_lo_rpm']:.1f} PSI   →   "
+            f"a ~{fp['rpm_hi_avg']:.0f} rpm: {fp['val_hi_rpm']:.1f} PSI"
+            f"   (Δ {-fp['sag']:+.1f} PSI)")
+        if sag_crit:
+            any_critical = True
+            row(f"⚠ CRÍTICO: la presión cae {fp['sag']:.1f} PSI justo al subir la demanda "
+                f"(~{fp['rpm_lo_avg']:.0f} → ~{fp['rpm_hi_avg']:.0f} rpm)")
+            note("Bomba al límite de caudal, filtro restringido, o regulador que no "
+                 "compensa — esto empobrece la mezcla justo en plena carga, donde más "
+                 "se necesita combustible y menos margen hay para error")
+        else:
+            row("✓ Presión sostenida — no cae de forma relevante con la demanda")
+    else:
+        row("Sin sensor de presión de combustible en el log — no se puede evaluar directo")
+        note("Si la calibración WOT muestra empobrecimiento creciente con el MAP, "
+             "considera la presión de combustible como sospechoso indirecto")
+
+    # ── Detonación ──
+    sec('Detonación (knock)')
+    kn = health['knock']
+    if kn['has_sensor']:
+        if kn['events'] > 0:
+            any_critical = True
+            row(f"⚠ CRÍTICO: {kn['events']} evento(s) de retraso por detonación durante "
+                f"WOT (máx {kn['max']:.1f}°)")
+            note("Detonación sostenida en plena carga puede dañar pistones/bielas — "
+                 "revisa octanaje del combustible, MAT, avance de encendido y la "
+                 "mezcla en esas celdas específicas")
+        else:
+            row("✓ Sin eventos de detonación detectados durante los pulls de WOT")
+    else:
+        row("Sin canal de Knock retard en el log — no se puede confirmar ausencia de detonación")
+
+    # ── Inyectores / duty cycle ──
+    sec('Saturación de inyectores (duty cycle)')
+    inj = health['injectors']
+    if inj['has_sensor']:
+        crit = inj['above_crit_pct'] > 0
+        warn = (not crit) and inj['above_warn_pct'] > 0
+        row(f"Prom: {inj['avg']:.1f}%   Máx: {inj['max']:.1f}%")
+        if crit:
+            any_critical = True
+            row(f"⚠ CRÍTICO: {inj['above_crit_pct']:.1f}% del tiempo en WOT sobre "
+                f"{_WOT_DC_CRIT_PCT:.0f}% — inyectores prácticamente saturados")
+            note("Si una celda sale pobre aquí, NO se corrige solo subiendo VE: el "
+                 "inyector ya no puede entregar más caudal (evalúa inyectores de mayor flujo)")
+        elif warn:
+            row(f"⚠ REVISAR: {inj['above_warn_pct']:.1f}% del tiempo en WOT sobre "
+                f"{_WOT_DC_WARN_PCT:.0f}% — cerca del límite de los inyectores")
+        else:
+            row(f"✓ Margen suficiente — máximo observado {inj['max']:.1f}%")
+    else:
+        row("Sin canal DutyCycle1 en el log — no se puede evaluar")
+
+    # ── Voltaje ──
+    sec('Voltaje bajo carga máxima')
+    v = health['voltage']
+    if v['has_sensor']:
+        crit = v['below_crit'] > 0
+        warn = (not crit) and v['below_warn'] > 0
+        row(f"Prom: {v['avg']:.2f}V   Mín: {v['min']:.2f}V")
+        if crit:
+            any_critical = True
+            row(f"⚠ CRÍTICO: {v['below_crit']} lectura(s) bajo {_WOT_VOLT_CRIT:.1f}V durante WOT")
+            note("Voltaje bajo en plena carga reduce el ancho de pulso real (battFac), "
+                 "el dwell y la energía de chispa — justo cuando el motor más los exige")
+        elif warn:
+            row(f"⚠ REVISAR: {v['below_warn']} lectura(s) bajo {_WOT_VOLT_WARN:.1f}V durante WOT")
+        else:
+            row(f"✓ Voltaje sostenido sobre {_WOT_VOLT_WARN:.1f}V")
+    else:
+        row("Sin canal Batt V en el log — no se puede evaluar")
+
+    # ── Heat-soak (MAT) ──
+    sec('Heat-soak de admisión (subida de MAT durante el pull)')
+    hs = health['heat_soak']
+    if hs['n_pulls'] > 0:
+        warn = hs['max_rise'] > _WOT_MAT_RISE_WARN
+        row(f"Pulls evaluados: {hs['n_pulls']}   Subida prom: {hs['avg_rise']:+.1f}°C   "
+            f"Subida máx: {hs['max_rise']:+.1f}°C")
+        if warn:
+            row(f"⚠ REVISAR: la MAT sube más de {_WOT_MAT_RISE_WARN:.0f}°C dentro de un mismo pull")
+            note("El aire se calienta con el motor en marcha (radiación del múltiple, "
+                 "ubicación del sensor, falta de aislación) — reduce densidad y potencia, "
+                 "y sube el riesgo de detonación en pulls largos o repetidos")
+        else:
+            row("✓ MAT estable dentro de cada pull")
+    else:
+        row("Sin datos suficientes de MAT por pull para evaluar heat-soak")
+
+    # ── Dwell ──
+    sec('Dwell de bobina bajo carga')
+    d = health['dwell']
+    if d['has_sensor']:
+        if d['below_2'] > 0:
+            row(f"⚠ {d['below_2']} lectura(s) de dwell bajo 2.0 ms durante WOT "
+                f"(prom {d['avg']:.2f} ms, mín {d['min']:.2f} ms)")
+            note("Dwell bajo a alta RPM puede producir chispa débil y fallos de "
+                 "combustión intermitentes justo bajo carga")
+        else:
+            row(f"✓ Dwell sostenido (prom {d['avg']:.2f} ms, mín {d['min']:.2f} ms)")
+    else:
+        row("Sin canal Dwell en el log — no se puede evaluar")
+
+    print()
+    if any_critical:
+        print("  ⚠ Hay condiciones que conviene revisar ANTES de seguir afinando la")
+        print("    mezcla en WOT — un problema mecánico o eléctrico de base puede")
+        print("    producir lecturas de AFR engañosas (p.ej. presión de combustible")
+        print("    cayendo simula una celda 'pobre' que no se arregla con VE).")
+    else:
+        print("  ✓ No se detectaron problemas críticos de salud durante los pulls de")
+        print("    WOT analizados (con los sensores disponibles en el log).")
 
 
 # ─────────────────────────────────────────────

@@ -55,6 +55,7 @@ from ve_analyzer import (
     detect_map_transient_events, print_map_transient_events,
     detect_stall_events, print_stall_events,
     load_wot_rows, detect_wot_pulls, analyze_wot_calibration, print_wot_calibration,
+    analyze_wot_health, print_wot_health,
     print_report, print_effectiveness, print_cell_detail,
 )
 
@@ -718,9 +719,13 @@ class VEAnalyzerApp:
             print("Analizando celdas alcanzadas en WOT…")
             result = analyze_wot_calibration(rows, ve_data)
 
+            print("Evaluando salud del motor durante los pulls de WOT…")
+            health = analyze_wot_health(rows, pulls)
+
             buf = io.StringIO()
             old = sys.stdout; sys.stdout = buf
             print_wot_calibration(result, pulls)
+            print_wot_health(health)
             sys.stdout = old
 
             rpt = buf.getvalue()
